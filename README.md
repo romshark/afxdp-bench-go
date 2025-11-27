@@ -224,30 +224,30 @@ auxiliary/mlx5_core.eth.5:
 
 ### Results
 
-Almost 10 gbps at 1360b packets in `XDP_COPY` mode:
+Almost 13 gbps at 1360b packets in `XDP_COPY` mode:
 
 ```txt
-AF_XDP TX (XDP_COPY):
-iface=center_1 queue_id=0 dst_mac=<redacted> src_ip=192.168.1.10 dst_ip=192.168.1.20 dst_port=9000 count=10000000 pkt_size=1360
-bound AF_XDP socket: ifindex=5 flags=0xa zerocopy=false
+AF_XDP TX:
+iface=center_1 queue_id=0 dst_mac=<redacted> src_ip=192.168.1.10 dst_ip=192.168.1.20 dst_port=9000 count=100000000 pkt_size=1360 zerocopy=false
+bound AF_XDP socket: ifindex=5 zerocopy=false
 srcMAC=<redacted> dstMAC=<redacted>
-finished: requested=10,000,000, duration=11.365170898s, rate=879,881 pps, 9573.11 Mbit/s (1.2 GB/s)
+finished: packets=100,000,000 | duration=1m26.277045439s | rate=1,159,056 pps | 12610.54 Mbit/s (1.6 GB/s)
 
-real    0m14.211s
-user    0m0.024s
-sys     0m0.010s
+real    1m26.930s
+user    0m0.002s
+sys     0m0.005s
 ```
 
-Line-rate (25 gbps) at 1360b packets in `XDP_ZEROCOPY` mode:
+Line-rate (~25 gbps) at 1360b packets in `XDP_ZEROCOPY` mode:
 
 ```txt
-AF_XDP TX (XDP_ZEROCOPY):
-iface=center_1 queue_id=0 dst_mac=<redacted> src_ip=192.168.1.10 dst_ip=192.168.1.20 dst_port=9000 count=10000000 pkt_size=1360
-bound AF_XDP socket: ifindex=5 flags=0xc zerocopy=true
+AF_XDP TX:
+iface=center_1 queue_id=0 dst_mac=<redacted> src_ip=192.168.1.10 dst_ip=192.168.1.20 dst_port=9000 count=100000000 pkt_size=1360 zerocopy=true
+bound AF_XDP socket: ifindex=5
 srcMAC=<redacted> dstMAC=<redacted>
-finished: requested=10,000,000, duration=4.452640593s, rate=2,245,858 pps, 24434.94 Mbit/s (3.1 GB/s)
+finished: packets=100,000,000 | duration=44.28407433s | rate=2,258,148 pps | 24568.65 Mbit/s (3.1 GB/s)
 
-real    0m5.136s
-user    0m0.000s
+real    0m44.937s
+user    0m0.001s
 sys     0m0.005s
 ```

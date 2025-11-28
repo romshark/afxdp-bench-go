@@ -2,9 +2,6 @@
 
 An [AF_XDP](https://docs.kernel.org/networking/af_xdp.html) benchmark in pure Go.
 
-Optionally, if you want a receiver use `runrecv.sh` and `recv.c` from
-https://gist.github.com/romshark/3dddcf65d877fdf3bb78f434132a9ea5.
-
 ## Prerequisites (Ubuntu)
 
 ```sh

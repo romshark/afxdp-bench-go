@@ -42,9 +42,14 @@ func ipChecksum(buf []byte) uint16 {
 	return ^uint16(sum)
 }
 
-func buildUDPPacket(buf []byte, srcMAC, dstMAC net.HardwareAddr,
-	srcIP, dstIP net.IP, srcPort, dstPort uint16,
-	seq uint32, pktSize uint32) uint32 {
+func buildUDPPacket(
+	buf []byte,
+	srcMAC, dstMAC net.HardwareAddr,
+	srcIP, dstIP net.IP,
+	srcPort, dstPort uint16,
+	seq uint32,
+	pktSize uint32,
+) uint32 {
 
 	const ethLen = 14
 	const ipLen = 20
@@ -90,19 +95,27 @@ func main() {
 	fCount := flag.Uint64("n", 0, "Packets to send")
 	fPktSize := flag.Uint("l", 1360, "Packet size")
 	fQueue := flag.Uint("q", 0, "Queue ID")
-	fZeroCopy := flag.Bool("z", false, "Use zerocopy")
+	fZeroCopy := flag.Bool("z", false, "Prefer zerocopy "+
+		"(automatically falls back to copy mode if not supported)")
 	flag.Parse()
 
 	ifaceIndex, srcMAC := mustGetIfaceInfo(*fIface)
 	fDestMAC, err := net.ParseMAC(*dstMACStr)
 	must(err)
+
 	fSrcIP := net.ParseIP(*srcIPStr).To4()
 	fDestIP := net.ParseIP(*dstIPStr).To4()
 
-	sock, err := afxdp.Open(afxdp.Config{
-		Iface:     *fIface,
+	iface, err := afxdp.MakeInterface(*fIface, afxdp.InterfaceConfig{
+		PreferZerocopy: *fZeroCopy,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "initializing interface: %v\n", err)
+		os.Exit(1)
+	}
+
+	sock, err := iface.Open(afxdp.SocketConfig{
 		QueueID:   uint32(*fQueue),
-		Zerocopy:  *fZeroCopy,
 		NumFrames: 4096,
 		FrameSize: 2048,
 		TxSize:    2048,
@@ -118,21 +131,21 @@ func main() {
 		*fPort, *fCount, *fPktSize, *fZeroCopy,
 	)
 
-	fmt.Fprintf(os.Stderr, "bound AF_XDP socket: ifindex=%d\n", ifaceIndex)
 	fmt.Fprintf(os.Stderr,
-		"srcMAC=%s dstMAC=%s\n",
-		net.HardwareAddr(srcMAC[:]),
-		fDestMAC,
-	)
+		"bound AF_XDP socket: ifindex=%d zerocopy=%t\n",
+		ifaceIndex, sock.IsZerocopy())
 
 	start := time.Now()
 
 	var (
 		seq   uint32
 		sent  uint64
+		bytes uint64
 		batch uint32
 	)
+
 	const batchSize = 64
+
 	for sent < *fCount {
 		frame := sock.NextFrame()
 		if frame.Buf == nil {
@@ -151,8 +164,11 @@ func main() {
 			seq,
 			uint32(*fPktSize),
 		)
+
 		must(sock.Submit(frame.Addr, length))
+
 		sent++
+		bytes += uint64(length)
 		seq++
 		batch++
 
@@ -161,21 +177,20 @@ func main() {
 			batch = 0
 		}
 	}
+
 	if batch > 0 {
-		// Flush remaining frames.
 		must(sock.FlushTx())
 	}
 
 	elapsed := time.Since(start)
-	stats := sock.StatsTx()
 
-	pps := float64(stats.TxPackets) / elapsed.Seconds()
-	bps := float64(stats.TxBytes*8) / elapsed.Seconds()
-	bytesPerSec := float64(stats.TxBytes) / elapsed.Seconds()
+	pps := float64(sent) / elapsed.Seconds()
+	bps := float64(bytes*8) / elapsed.Seconds()
+	bytesPerSec := float64(bytes) / elapsed.Seconds()
 
 	fmt.Fprintf(os.Stderr,
 		"finished: packets=%s | duration=%s | rate=%s pps | %.2f Mbit/s (%s/s)\n",
-		humanize.Comma(int64(stats.TxPackets)),
+		humanize.Comma(int64(sent)),
 		elapsed,
 		humanize.Comma(int64(pps)),
 		bps/1e6,

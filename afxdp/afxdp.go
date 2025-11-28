@@ -1,13 +1,25 @@
 //go:build linux
 
-// Package afxdp implements an AF_XDP zero-copy capable socket.
-// See https://docs.kernel.org/networking/af_xdp.html
+// Package afxdp implements AF_XDP zero-copy capable sockets.
+// Interface owns XDP program + eBPF objects.
+// Socket is an AF_XDP socket bound to a specific RX/TX queue.
+//
+// Terminology mapping (kernel ↔ userspace):
+//
+//   - RX ring: raw packets delivered from NIC to userspace.
+//   - FQ ring: UMEM addresses userspace provides to kernel for RX.
+//   - TX ring: descriptors userspace sends to NIC.
+//   - CQ ring: completed TX buffers returned by kernel.
 package afxdp
 
 import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"unsafe"
 
@@ -19,13 +31,140 @@ import (
 )
 
 var (
-	ErrMissingIface        = errors.New("iface not set")
 	ErrXSKSMapNotFound     = errors.New("xsks_map not found")
 	ErrXDPSockProgNotFound = errors.New("xdp_sock_prog not found")
 	ErrTXRegionIsEmpty     = errors.New("tx region is empty")
 	ErrCQRegionIsEmpty     = errors.New("cq region is empty")
+	ErrNumFramesTooSmall   = errors.New("NumFrames must be >= TxSize + RxSize")
 )
 
+// InterfaceConfig controls how AF_XDP is attached to a network interface.
+type InterfaceConfig struct {
+	PreferZerocopy bool
+}
+
+type SocketConfig struct {
+	// QueueID identifies the NIC RX/TX queue to bind to.
+	QueueID uint32
+	// NumFrames is the total number of UMEM frames allocated.
+	NumFrames uint32
+	// FrameSize defines the size of each UMEM frame in bytes.
+	FrameSize uint32
+	// RxSize sets the number of descriptors in the RX ring.
+	RxSize uint32
+	// TxSize sets the number of descriptors in the TX ring.
+	TxSize uint32
+	// CqSize sets the number of entries in the completion ring.
+	CqSize uint32
+	// BatchSize controls TX and completion processing batch size.
+	BatchSize uint32
+}
+
+func (c *SocketConfig) ValidateAndSetDefaults() error {
+	if c.NumFrames == 0 {
+		c.NumFrames = DefaultNumFrames
+	}
+	if c.FrameSize == 0 {
+		c.FrameSize = DefaultFrameSize
+	}
+	if c.RxSize == 0 {
+		c.RxSize = DefaultTxQueueSize
+	}
+	if c.TxSize == 0 {
+		c.TxSize = DefaultTxQueueSize
+	}
+	if c.CqSize == 0 {
+		c.CqSize = DefaultCompletionRingSize
+	}
+	if c.BatchSize == 0 {
+		c.BatchSize = DefaultBatchSize
+	}
+	if c.NumFrames < c.TxSize+c.RxSize {
+		return ErrNumFramesTooSmall
+	}
+	return nil
+}
+
+// Interface represents a NIC with an XDP program attached for AF_XDP use.
+// It owns the XDP program and eBPF objects and can create AF_XDP sockets
+// bound to individual hardware queues.
+type Interface struct {
+	ifaceName      string
+	ifaceIndex     int
+	preferZerocopy bool
+
+	link link.Link
+	objs *xdp.XdpProgObjects
+}
+
+// MakeInterface attaches the XDP program to the given interface name
+// and returns an Interface handle that can open AF_XDP sockets on its queues.
+// The XDP program is attached once per Interface.
+func MakeInterface(iface string, conf InterfaceConfig) (*Interface, error) {
+	netIf, err := net.InterfaceByName(iface)
+	if err != nil {
+		return nil, fmt.Errorf("getting interface: %w", err)
+	}
+
+	l, objs, err := attachXDP(iface, conf.PreferZerocopy)
+	if err != nil {
+		return nil, fmt.Errorf("attaching XDP program: %w", err)
+	}
+
+	return &Interface{
+		ifaceName:      iface,
+		preferZerocopy: conf.PreferZerocopy,
+		ifaceIndex:     netIf.Index,
+		link:           l,
+		objs:           objs,
+	}, nil
+}
+
+// RXQueueIDs returns the list of RX queue IDs available on the interface,
+// sorted in ascending order inspecting /sys/class/net/<iface>/queues.
+func (i *Interface) RXQueueIDs() (ids []uint32, err error) {
+	path := "/sys/class/net/" + i.ifaceName + "/queues"
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading %q: %w", path, err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "rx-") {
+			idStr := e.Name()[3:]
+			id, err := strconv.Atoi(idStr)
+			if err != nil {
+				return nil, fmt.Errorf("parsing entry %q: %w", idStr, err)
+			}
+			ids = append(ids, uint32(id))
+		}
+	}
+	slices.Sort(ids)
+	return ids, nil
+}
+
+// Close detaches the XDP program from the interface and frees the underlying
+// eBPF resources owned by this Interface. It does not close any Socket instances;
+// those must be closed separately before closing the Interface.
+func (i *Interface) Close() error {
+	var errs []error
+	if i.link != nil {
+		if err := i.link.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing XDP link: %w", err))
+		}
+		i.link = nil
+	}
+
+	if i.objs != nil {
+		if err := i.objs.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing XDP objs: %w", err))
+		}
+		i.objs = nil
+	}
+	return errors.Join(errs...)
+}
+
+// registerXSK registers the socket FD in the xsks_map for the given queue.
+// This allows the XDP program to redirect packets to the correct AF_XDP socket.
 func registerXSK(objs *xdp.XdpProgObjects, fd int, queue uint32) error {
 	if objs.XsksMap == nil {
 		return ErrXSKSMapNotFound
@@ -33,6 +172,8 @@ func registerXSK(objs *xdp.XdpProgObjects, fd int, queue uint32) error {
 	return objs.XsksMap.Update(queue, uint32(fd), ebpf.UpdateAny)
 }
 
+// attachXDP loads and attaches the XDP program to the interface.
+// When zerocopy is true, driver mode is requested to enable AF_XDP zero-copy.
 func attachXDP(ifaceName string, zerocopy bool) (link.Link, *xdp.XdpProgObjects, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
@@ -72,6 +213,7 @@ const (
 	DefaultNumFrames          = 4096
 	DefaultFrameSize          = 2048
 	DefaultTxQueueSize        = 2048
+	DefaultRxQueueSize        = DefaultTxQueueSize
 	DefaultCompletionRingSize = 2048
 	DefaultBatchSize          = 64 // TX batching
 )
@@ -125,6 +267,9 @@ type xdp_desc struct {
 
 /*---- Queue wrappers ----*/
 
+// xdpUQueue represents a userspace ring queue backed by shared memory.
+// It mirrors the kernel ring structure and maintains cached producer/consumer
+// indices to reduce atomic traffic.
 type xdpUQueue struct {
 	cachedProd uint32
 	cachedCons uint32
@@ -135,6 +280,8 @@ type xdpUQueue struct {
 	descs      []xdp_desc
 }
 
+// xdpUMemQueue represents a UMEM address ring (FQ or CQ).
+// Entries are raw UMEM offsets managed by kernel and userspace.
 type xdpUMemQueue struct {
 	cachedProd uint32
 	cachedCons uint32
@@ -225,8 +372,10 @@ func mmapUmem(length uintptr) ([]byte, error) {
 	return *(*[]byte)(unsafe.Pointer(sh)), nil
 }
 
-// makeTxQueue builds TX user queue from mmap + offsets.
-func makeTxQueue(region []byte, off xdp_ring_offset, size uint32) (*xdpUQueue, error) {
+// makeQueue builds RX/TX user queue from mmap + offsets.
+func makeQueue(
+	region []byte, off xdp_ring_offset, size uint32, isTx bool,
+) (*xdpUQueue, error) {
 	if len(region) == 0 {
 		return nil, ErrTXRegionIsEmpty
 	}
@@ -238,6 +387,11 @@ func makeTxQueue(region []byte, off xdp_ring_offset, size uint32) (*xdpUQueue, e
 	descPtr := unsafe.Add(base, off.Desc)
 	descs := unsafe.Slice((*xdp_desc)(descPtr), size)
 
+	cachedCons := uint32(0)
+	if isTx {
+		cachedCons = size
+	}
+
 	return &xdpUQueue{
 		mask:       size - 1,
 		size:       size,
@@ -245,7 +399,7 @@ func makeTxQueue(region []byte, off xdp_ring_offset, size uint32) (*xdpUQueue, e
 		cons:       cons,
 		descs:      descs,
 		cachedProd: 0,
-		cachedCons: size,
+		cachedCons: cachedCons,
 	}, nil
 }
 
@@ -277,44 +431,42 @@ func makeUMemQueue(
 
 /*---- Queue operations ----*/
 
-// txRingAvailableSlots returns number of TX descriptors that are currently free.
-//
-// TX ring semantics:
-// - cachedProd = user-space producer position (what we have reserved)
-// - cachedCons = user-space view of kernel consumer position
-//
-// Free descriptors = cachedCons - cachedProd
-//
-// If not enough space is visible, we refresh cachedCons by reading the
-// real kernel consumer index (*q.cons) and extending it by ring size.
-func txRingAvailableSlots(q *xdpUQueue, ndescs uint32) uint32 {
+// rxAvailable returns the number of RX descriptors available to consume.
+func rxAvailable(q *xdpUQueue) uint32 {
+	avail := q.cachedProd - q.cachedCons
+	if avail > 0 {
+		return avail
+	}
+
+	q.cachedProd = atomic.LoadUint32(q.prod)
+	return q.cachedProd - q.cachedCons
+}
+
+// reserveTx reserves nDescs TX descriptors if space is available.
+// Returns zero if the ring is full.
+func reserveTx(q *xdpUQueue, nDescs uint32, idx *uint32) int {
 	free := q.cachedCons - q.cachedProd
-	if free >= ndescs {
-		return free
+	if free < nDescs {
+		cons := atomic.LoadUint32(q.cons)
+		q.cachedCons = cons + q.size
+		if q.cachedCons-q.cachedProd < nDescs {
+			return 0
+		}
 	}
-	// Refresh tail from kernel.
-	cons := atomic.LoadUint32(q.cons)
-	q.cachedCons = cons + q.size
-	return q.cachedCons - q.cachedProd
-}
 
-// reserveTxDescriptors attempts to reserve n descriptors in the TX ring.
-// Returns the starting index in idx, or 0 if ring is full.
-func reserveTxDescriptors(q *xdpUQueue, ndescs uint32, idx *uint32) int {
-	if txRingAvailableSlots(q, ndescs) < ndescs {
-		return 0
-	}
 	*idx = q.cachedProd
-	q.cachedProd += ndescs
-	return int(ndescs)
+	q.cachedProd += nDescs
+	return int(nDescs)
 }
 
-// commitTxDescriptors publishes queued TX descriptors to the kernel.
-func commitTxDescriptors(q *xdpUQueue) {
+// commitTxDescriptors publishes TX descriptors to the kernel
+// by updating the producer index.
+func commitTxDescriptors(queueProd *uint32, queueCachedProd uint32) {
 	// Descriptors are written; now publish producer index.
-	atomic.StoreUint32(q.prod, q.cachedProd)
+	atomic.StoreUint32(queueProd, queueCachedProd)
 }
 
+// umemNbAvail returns the number of UMEM entries available to consume, capped by nb.
 func umemNbAvail(q *xdpUMemQueue, nb uint32) uint32 {
 	entries := q.cachedProd - q.cachedCons
 	if entries == 0 {
@@ -328,6 +480,8 @@ func umemNbAvail(q *xdpUMemQueue, nb uint32) uint32 {
 	return entries
 }
 
+// umemCompleteFromKernel copies completed UMEM addresses into dst
+// and advances the consumer index.
 func umemCompleteFromKernel(q *xdpUMemQueue, dst []uint64, nb uint32) uint32 {
 	entries := umemNbAvail(q, nb)
 	var i uint32
@@ -357,100 +511,59 @@ func wakeupTxQueue(fd int) error {
 	return err
 }
 
-type Config struct {
-	Iface     string
-	QueueID   uint32
-	Zerocopy  bool
-	BatchSize uint32
-
-	NumFrames uint32
-	FrameSize uint32
-	TxSize    uint32
-	CqSize    uint32
-}
-
-type Stats struct {
-	TxPackets uint64
-	TxBytes   uint64
-}
-
 // Socket is an AF_XDP bidirectional socket.
 //
 // WARNING: Socket is not safe for concurrent use.
 type Socket struct {
-	cfg Config
+	conf       SocketConfig
+	isZerocopy bool
 
 	fd int
 
 	umem []byte
 	tx   *xdpUQueue
 	cq   *xdpUMemQueue
+	rx   *xdpUQueue
+	fq   *xdpUMemQueue
 
 	txRegion []byte
 	cqRegion []byte
 
 	freeFrames []uint64
-	freeCnt    uint32
+	freeCount  uint32
 
 	compBuf []uint64
 
-	stats Stats
-
-	xdpLink link.Link
-	xdpObjs *xdp.XdpProgObjects
+	iface *Interface
 
 	fqRegion []byte
 }
 
-// Open creates and initializes an AF_XDP socket with UMEM, TX + CQ rings.
-func Open(cfg Config) (*Socket, error) {
-	if cfg.Iface == "" {
-		return nil, ErrMissingIface
-	}
-
+// Open creates and initializes an AF_XDP socket.
+// It allocates UMEM, maps rings, configures kernel structures,
+// binds to the target NIC queue and registers the socket in xsks_map.
+func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 	// Apply defaults if necessary.
-	if cfg.NumFrames == 0 {
-		cfg.NumFrames = DefaultNumFrames
-	}
-	if cfg.FrameSize == 0 {
-		cfg.FrameSize = DefaultFrameSize
-	}
-	if cfg.TxSize == 0 {
-		cfg.TxSize = DefaultTxQueueSize
-	}
-	if cfg.CqSize == 0 {
-		cfg.CqSize = DefaultCompletionRingSize
-	}
-	if cfg.BatchSize == 0 {
-		cfg.BatchSize = DefaultBatchSize
+	if err := conf.ValidateAndSetDefaults(); err != nil {
+		return nil, err
 	}
 
 	// TODO: currently, Open would leak memory if some of the following
 	// operations fail.
 
-	// Attach XDP program.
-	xdpLink, objs, err := attachXDP(cfg.Iface, cfg.Zerocopy)
+	iface, err := net.InterfaceByName(i.ifaceName)
 	if err != nil {
-		return nil, fmt.Errorf("attaching XDP to iface: %w", err)
-	}
-
-	iface, err := net.InterfaceByName(cfg.Iface)
-	if err != nil {
-		xdpLink.Close()
-		objs.Close()
 		return nil, fmt.Errorf("fetching iface info by name: %w", err)
 	}
 
 	// AF_XDP socket.
 	fd, err := unix.Socket(unix.AF_XDP, unix.SOCK_RAW, 0)
 	if err != nil {
-		xdpLink.Close()
-		objs.Close()
 		return nil, fmt.Errorf("opening AF_XDP socket: %w", err)
 	}
 
 	// UMEM registration.
-	umemLen := uintptr(cfg.NumFrames) * uintptr(cfg.FrameSize)
+	umemLen := uintptr(conf.NumFrames) * uintptr(conf.FrameSize)
 	umem, err := mmapUmem(umemLen)
 	if err != nil {
 		return nil, fmt.Errorf("mmap UMEM: %w", err)
@@ -459,7 +572,7 @@ func Open(cfg Config) (*Socket, error) {
 	reg := xdp_umem_reg{
 		Addr:      uint64(uintptr(unsafe.Pointer(&umem[0]))),
 		Len:       uint64(len(umem)),
-		ChunkSize: cfg.FrameSize,
+		ChunkSize: conf.FrameSize,
 		Headroom:  0,
 	}
 	if err := setsockopt(
@@ -467,21 +580,17 @@ func Open(cfg Config) (*Socket, error) {
 		unsafe.Pointer(&reg), unsafe.Sizeof(reg),
 	); err != nil {
 		unix.Close(fd)
-		xdpLink.Close()
-		objs.Close()
 		return nil, fmt.Errorf("setsockopt XDP_UMEM_REG: %w", err)
 	}
 
 	// UMEM ring sizes.
-	fillSize := cfg.TxSize
-	compSize := cfg.CqSize
+	fillSize := conf.RxSize
+	compSize := conf.CqSize
 	if err := setsockopt(
 		fd, unix.SOL_XDP, unix.XDP_UMEM_FILL_RING,
 		unsafe.Pointer(&fillSize), unsafe.Sizeof(fillSize),
 	); err != nil {
 		unix.Close(fd)
-		xdpLink.Close()
-		objs.Close()
 		return nil, fmt.Errorf("setsockopt XDP_UMEM_FILL_RING: %w", err)
 	}
 	if err := setsockopt(
@@ -489,21 +598,27 @@ func Open(cfg Config) (*Socket, error) {
 		unsafe.Pointer(&compSize), unsafe.Sizeof(compSize),
 	); err != nil {
 		unix.Close(fd)
-		xdpLink.Close()
-		objs.Close()
 		return nil, fmt.Errorf("setsockopt XDP_UMEM_COMPLETION_RING: %w", err)
 	}
 
 	// TX ring size on socket.
-	txSize := cfg.TxSize
+	txSize := conf.TxSize
 	if err := setsockopt(
 		fd, unix.SOL_XDP, unix.XDP_TX_RING,
 		unsafe.Pointer(&txSize), unsafe.Sizeof(txSize),
 	); err != nil {
 		unix.Close(fd)
-		xdpLink.Close()
-		objs.Close()
 		return nil, fmt.Errorf("setsockopt XDP_TX_RING: %w", err)
+	}
+
+	// RX ring size on socket.
+	rxSize := conf.RxSize
+	if err := setsockopt(
+		fd, unix.SOL_XDP, unix.XDP_RX_RING,
+		unsafe.Pointer(&rxSize), unsafe.Sizeof(rxSize),
+	); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("setsockopt XDP_RX_RING: %w", err)
 	}
 
 	// Query mmap offsets for all rings.
@@ -513,122 +628,135 @@ func Open(cfg Config) (*Socket, error) {
 		unsafe.Pointer(&offs), unsafe.Sizeof(offs),
 	); err != nil {
 		unix.Close(fd)
-		xdpLink.Close()
-		objs.Close()
 		return nil, fmt.Errorf("setsockopt XDP_MMAP_OFFSETS: %w", err)
 	}
 
 	// Map TX ring (descriptors).
-	txRegionLen := uintptr(offs.Tx.Desc) + uintptr(cfg.TxSize)*unsafe.Sizeof(xdp_desc{})
+	txRegionLen := uintptr(offs.Tx.Desc) + uintptr(conf.TxSize)*unsafe.Sizeof(xdp_desc{})
 	txRegion, err := mmapRegion(fd, txRegionLen, unix.XDP_PGOFF_TX_RING)
 	if err != nil {
 		return nil, fmt.Errorf("mmap TX ring: %w", err)
 	}
 
 	// Map CQ ring (UMEM completion ring, uint64 addresses).
-	cqRegionLen := uintptr(offs.Cr.Desc) + uintptr(cfg.CqSize)*unsafe.Sizeof(uint64(0))
+	cqRegionLen := uintptr(offs.Cr.Desc) + uintptr(conf.CqSize)*unsafe.Sizeof(uint64(0))
 	cqRegion, err := mmapRegion(fd, cqRegionLen, unix.XDP_UMEM_PGOFF_COMPLETION_RING)
 	if err != nil {
 		return nil, fmt.Errorf("mmap CQ ring: %w", err)
 	}
 
+	// Map RX ring
+	rxRegionLen := uintptr(offs.Rx.Desc) + uintptr(conf.RxSize)*unsafe.Sizeof(xdp_desc{})
+	rxRegion, err := mmapRegion(fd, rxRegionLen, unix.XDP_PGOFF_RX_RING)
+	if err != nil {
+		return nil, fmt.Errorf("mmap RX ring: %w", err)
+	}
+
 	// Map FQ ring (UMEM fill ring, uint64 addresses) – populated only for zerocopy.
-	var fqRegion []byte
-	if cfg.Zerocopy {
-		fqRegionLen := uintptr(offs.Fr.Desc) + uintptr(cfg.TxSize)*unsafe.Sizeof(uint64(0))
-		fqRegion, err = mmapRegion(fd, fqRegionLen, unix.XDP_UMEM_PGOFF_FILL_RING)
-		if err != nil {
-			return nil, fmt.Errorf("mmap FQ ring: %w", err)
-		}
+	fqRegionLen := uintptr(offs.Fr.Desc) + uintptr(conf.RxSize)*unsafe.Sizeof(uint64(0))
+	fqRegion, err := mmapRegion(fd, fqRegionLen, unix.XDP_UMEM_PGOFF_FILL_RING)
+	if err != nil {
+		return nil, fmt.Errorf("mmap FQ ring: %w", err)
 	}
 
 	// Build queues.
-	txQ, err := makeTxQueue(txRegion, offs.Tx, cfg.TxSize)
+	txQ, err := makeQueue(txRegion, offs.Tx, conf.TxSize, true)
 	if err != nil {
 		return nil, fmt.Errorf("making TX queue: %w", err)
 	}
-	cqQ, err := makeUMemQueue(cqRegion, offs.Cr, cfg.CqSize)
+	cqQ, err := makeUMemQueue(cqRegion, offs.Cr, conf.CqSize)
 	if err != nil {
 		return nil, fmt.Errorf("making CQ queue: %w", err)
 	}
+	rxQ, err := makeQueue(rxRegion, offs.Rx, conf.RxSize, false)
+	if err != nil {
+		return nil, fmt.Errorf("making RX queue: %w", err)
+	}
+	fqQ, err := makeUMemQueue(fqRegion, offs.Fr, conf.RxSize)
+	if err != nil {
+		return nil, fmt.Errorf("making FQ queue: %w", err)
+	}
 
-	// Populate FQ for zerocopy.
-	if cfg.Zerocopy {
-		base := unsafe.Pointer(&fqRegion[0])
-		fqProd := (*uint32)(unsafe.Add(base, offs.Fr.Producer))
-		prod := *fqProd
+	{ // Populate FQ with initial UMEM frames.
+		ringSize := fqQ.size
+		prod := atomic.LoadUint32(fqQ.prod)
 
-		ringSize := cfg.TxSize
+		// Use the first ringSize frames from UMEM for RX.
 		for i := uint32(0); i < ringSize; i++ {
-			idx := (prod + i) & (ringSize - 1)
-			entryPtr := unsafe.Add(base,
-				uintptr(offs.Fr.Desc)+uintptr(idx)*unsafe.Sizeof(uint64(0)))
-			*(*uint64)(entryPtr) = uint64(i) * uint64(cfg.FrameSize)
+			idx := (prod + i) & fqQ.mask
+			fqQ.addrs[idx] = uint64(i) * uint64(conf.FrameSize)
 		}
-		*fqProd = prod + ringSize
+
+		atomic.StoreUint32(fqQ.prod, prod+ringSize)
+		// cached indices are not used for FQ anymore
+		fqQ.cachedProd = atomic.LoadUint32(fqQ.prod)
+		fqQ.cachedCons = atomic.LoadUint32(fqQ.cons)
 	}
 
 	// Bind AF_XDP socket to iface:queue.
 	sa := &sockaddr_xdp{
 		Family:  unix.AF_XDP,
 		Ifindex: uint32(iface.Index),
-		QueueID: cfg.QueueID,
+		QueueID: conf.QueueID,
 	}
 
-	if cfg.Zerocopy {
+	zerocopy := i.preferZerocopy
+	if zerocopy {
 		sa.Flags = unix.XDP_ZEROCOPY | unix.XDP_USE_NEED_WAKEUP
 	} else {
 		sa.Flags = unix.XDP_COPY | unix.XDP_USE_NEED_WAKEUP
 	}
 
 	err = rawBind(fd, sa)
-	if err != nil && cfg.Zerocopy {
+	if err != nil && zerocopy {
 		// If zerocopy is not supported for this queue, fall back to copy mode.
 		if errno, ok := err.(unix.Errno); ok && errno == unix.EPROTONOSUPPORT {
 			sa.Flags = unix.XDP_COPY | unix.XDP_USE_NEED_WAKEUP
-			cfg.Zerocopy = false
+			zerocopy = false
 			err = rawBind(fd, sa)
 		}
 	}
 	if err != nil {
 		unix.Close(fd)
-		xdpLink.Close()
-		objs.Close()
 		return nil, fmt.Errorf("binding socket: %w", err)
 	}
 
-	if err := registerXSK(objs, fd, cfg.QueueID); err != nil {
+	if err := registerXSK(i.objs, fd, conf.QueueID); err != nil {
 		unix.Close(fd)
-		xdpLink.Close()
-		objs.Close()
 		return nil, fmt.Errorf("registering XSK: %w", err)
 	}
 
 	// Local free-frame pool.
-	freeFrames := make([]uint64, cfg.NumFrames)
-	for i := uint32(0); i < cfg.NumFrames; i++ {
-		freeFrames[i] = uint64(i) * uint64(cfg.FrameSize)
+	freeFrames := make([]uint64, conf.NumFrames)
+	for i := uint32(0); i < conf.NumFrames; i++ {
+		freeFrames[i] = uint64(i) * uint64(conf.FrameSize)
 	}
 
 	s := &Socket{
-		cfg:        cfg,
+		conf:       conf,
+		isZerocopy: zerocopy,
 		fd:         fd,
 		umem:       umem,
 		tx:         txQ,
 		cq:         cqQ,
+		rx:         rxQ,
+		fq:         fqQ,
 		txRegion:   txRegion,
 		cqRegion:   cqRegion,
 		freeFrames: freeFrames,
-		freeCnt:    cfg.NumFrames,
-		compBuf:    make([]uint64, cfg.BatchSize),
-		stats:      Stats{},
-		xdpLink:    xdpLink,
-		xdpObjs:    objs,
+		freeCount:  conf.NumFrames,
+		compBuf:    make([]uint64, conf.BatchSize),
+		iface:      i,
 		fqRegion:   fqRegion,
 	}
 
 	return s, nil
 }
+
+// IsZerocopy reports whether the socket is operating in zero-copy mode.
+// May return false even if PreferZerocopy was true because the corresponding queue
+// may not support XDP_ZEROCOPY mode and the socket fall back to XDP_COPY automatically.
+func (s *Socket) IsZerocopy() bool { return s.isZerocopy }
 
 // Close releases the socket, UMEM and kernel resources.
 func (s *Socket) Close() error {
@@ -639,20 +767,6 @@ func (s *Socket) Close() error {
 			errs = append(errs, fmt.Errorf("closing fd: %w", err))
 		}
 		s.fd = 0
-	}
-
-	if s.xdpLink != nil {
-		if err := s.xdpLink.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("closing XDP link: %w", err))
-		}
-		s.xdpLink = nil
-	}
-
-	if s.xdpObjs != nil {
-		if err := s.xdpObjs.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("closing XDP objs: %w", err))
-		}
-		s.xdpObjs = nil
 	}
 
 	// Explicitly unmap UMEM and ring regions.
@@ -687,6 +801,77 @@ func (s *Socket) Close() error {
 	return errors.Join(errs...)
 }
 
+// Wait blocks until the AF_XDP socket becomes readable or the timeout expires.
+// Returns nil when the socket becomes readable OR when the timeout expires.
+// Returns a non-nil error only for real system call failures.
+func (s *Socket) Wait(timeoutMS int) error {
+	for {
+		_, err := unix.Poll([]unix.PollFd{{
+			Fd:     int32(s.fd),
+			Events: unix.POLLIN,
+		}}, timeoutMS)
+
+		if err == nil {
+			return nil
+		}
+
+		// EINTR is not treated as an error and will never be surfaced to the caller.
+		// This ensures stable behavior in environments where signals are delivered
+		// (profilers, debuggers, timers, SIGCHLD, etc.).
+		if err == unix.EINTR {
+			continue // Retry on signal interruption.
+		}
+
+		return err
+	}
+}
+
+// Receive retrieves up to max frames from the RX ring.
+// Returned frames reference UMEM and must be returned via Release.
+func (s *Socket) Receive(max uint32) ([]Frame, error) {
+	var frames []Frame
+
+	avail := rxAvailable(s.rx)
+	if avail == 0 {
+		return nil, nil
+	}
+
+	if avail > max {
+		avail = max
+	}
+
+	for i := uint32(0); i < avail; i++ {
+		idx := s.rx.cachedCons & s.rx.mask
+		d := s.rx.descs[idx]
+
+		start := int(d.Addr)
+		end := start + int(d.Len)
+
+		frames = append(frames, Frame{
+			Buf:  s.umem[start:end],
+			Addr: d.Addr,
+		})
+
+		s.rx.cachedCons++
+	}
+
+	atomic.StoreUint32(s.rx.cons, s.rx.cachedCons)
+	return frames, nil
+}
+
+// Release returns a received frame to the fill queue for reuse.
+func (s *Socket) Release(frame Frame) error {
+	// Single producer: for every packet we receive, we return one buffer.
+	// This keeps FQ occupancy bounded without fancy accounting.
+	prod := atomic.LoadUint32(s.fq.prod)
+	idx := prod & s.fq.mask
+
+	s.fq.addrs[idx] = frame.Addr
+	atomic.StoreUint32(s.fq.prod, prod+1)
+
+	return nil
+}
+
 // Frame represents a borrowed UMEM frame from an AF_XDP socket.
 type Frame struct {
 	// Buf points directly into the UMEM region and can be written to
@@ -702,18 +887,18 @@ type Frame struct {
 // A zero-value frame indicates that no frame is currently available and the
 // caller should retry after PollCompletions().
 func (s *Socket) NextFrame() Frame {
-	if s.freeCnt == 0 {
+	if s.freeCount == 0 {
 		// Try to reclaim some completions.
 		s.PollCompletions(uint32(len(s.compBuf)))
-		if s.freeCnt == 0 {
+		if s.freeCount == 0 {
 			return Frame{}
 		}
 	}
 
-	s.freeCnt--
-	addr := s.freeFrames[s.freeCnt]
+	s.freeCount--
+	addr := s.freeFrames[s.freeCount]
 
-	frameSize := s.cfg.FrameSize
+	frameSize := s.conf.FrameSize
 	if frameSize == 0 {
 		frameSize = DefaultFrameSize
 	}
@@ -733,11 +918,11 @@ func (s *Socket) Submit(addr uint64, length uint32) error {
 
 	// Reserve one descriptor; spin until we get space.
 	for {
-		if reserveTxDescriptors(s.tx, 1, &idx) > 0 {
+		if reserveTx(s.tx, 1, &idx) > 0 {
 			break
 		}
 		// Ring full: try to reclaim and wake up the NIC.
-		if s.PollCompletions(s.cfg.BatchSize) == 0 {
+		if s.PollCompletions(s.conf.BatchSize) == 0 {
 			if err := wakeupTxQueue(s.fd); err != nil {
 				return err
 			}
@@ -748,9 +933,6 @@ func (s *Socket) Submit(addr uint64, length uint32) error {
 	d.Addr = addr
 	d.Len = length
 	d.Opts = 0
-
-	s.stats.TxPackets++
-	s.stats.TxBytes += uint64(length)
 	return nil
 }
 
@@ -758,7 +940,7 @@ func (s *Socket) Submit(addr uint64, length uint32) error {
 // Required when XDP_USE_NEED_WAKEUP is enabled.
 func (s *Socket) FlushTx() error {
 	// Commit all pending descriptors and ring the doorbell.
-	commitTxDescriptors(s.tx)
+	commitTxDescriptors(s.tx.prod, s.tx.cachedProd)
 	return wakeupTxQueue(s.fd)
 }
 
@@ -775,13 +957,8 @@ func (s *Socket) PollCompletions(maxFrames uint32) uint32 {
 
 	n := umemCompleteFromKernel(s.cq, s.compBuf, maxFrames)
 	for i := range n {
-		s.freeFrames[s.freeCnt] = s.compBuf[i]
-		s.freeCnt++
+		s.freeFrames[s.freeCount] = s.compBuf[i]
+		s.freeCount++
 	}
 	return n
-}
-
-// StatsTx returns cumulative transmission counters.
-func (s *Socket) StatsTx() Stats {
-	return s.stats
 }

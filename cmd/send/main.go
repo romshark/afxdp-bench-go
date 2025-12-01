@@ -42,15 +42,13 @@ func ipChecksum(buf []byte) uint16 {
 	return ^uint16(sum)
 }
 
-func buildUDPPacket(
-	buf []byte,
+func buildUDPPacket(buf []byte,
 	srcMAC, dstMAC net.HardwareAddr,
 	srcIP, dstIP net.IP,
 	srcPort, dstPort uint16,
 	seq uint32,
 	pktSize uint32,
 ) uint32 {
-
 	const ethLen = 14
 	const ipLen = 20
 	const udpLen = 8
@@ -88,9 +86,9 @@ func buildUDPPacket(
 
 func main() {
 	fIface := flag.String("i", "", "Interface")
-	dstMACStr := flag.String("d", "", "Destination MAC")
-	srcIPStr := flag.String("s", "", "Source IP")
-	dstIPStr := flag.String("D", "", "Destination IP")
+	fDestMACStr := flag.String("d", "", "Destination MAC")
+	fSrcIPStr := flag.String("s", "", "Source IP")
+	fDestIPStr := flag.String("D", "", "Destination IP")
 	fPort := flag.Int("p", 0, "Destination port")
 	fCount := flag.Uint64("n", 0, "Packets to send")
 	fPktSize := flag.Uint("l", 1360, "Packet size")
@@ -100,24 +98,21 @@ func main() {
 	flag.Parse()
 
 	ifaceIndex, srcMAC := mustGetIfaceInfo(*fIface)
-	fDestMAC, err := net.ParseMAC(*dstMACStr)
-	must(err)
 
-	fSrcIP := net.ParseIP(*srcIPStr).To4()
-	fDestIP := net.ParseIP(*dstIPStr).To4()
+	dstMAC, err := net.ParseMAC(*fDestMACStr)
+	must(err)
+	srcIP := net.ParseIP(*fSrcIPStr).To4()
+	dstIP := net.ParseIP(*fDestIPStr).To4()
 
 	iface, err := afxdp.MakeInterface(*fIface, afxdp.InterfaceConfig{
 		PreferZerocopy: *fZeroCopy,
 	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "initializing interface: %v\n", err)
-		os.Exit(1)
-	}
+	must(err)
 
 	sock, err := iface.Open(afxdp.SocketConfig{
 		QueueID:   uint32(*fQueue),
-		NumFrames: 4096,
 		FrameSize: 2048,
+		NumFrames: 1024 * 8,
 		TxSize:    2048,
 		CqSize:    2048,
 	})
@@ -125,75 +120,105 @@ func main() {
 	defer sock.Close()
 
 	fmt.Fprintf(os.Stderr,
-		"AF_XDP TX:\niface=%s queue_id=%d dst_mac=%s src_ip=%s dst_ip=%s "+
-			"dst_port=%d count=%d pkt_size=%d zerocopy=%t\n",
-		*fIface, *fQueue, fDestMAC, fSrcIP, fDestIP,
-		*fPort, *fCount, *fPktSize, *fZeroCopy,
+		"AF_XDP TX:\niface=%s queue=%d dst_mac=%s src_ip=%s dst_ip=%s dst_port=%d count=%d zc=%t\n",
+		*fIface, *fQueue, dstMAC, srcIP, dstIP, *fPort, *fCount, sock.IsZerocopy(),
+	)
+	fmt.Fprintf(os.Stderr, "bound: ifindex=%d zerocopy=%t\n", ifaceIndex, sock.IsZerocopy())
+
+	const dstPort = 12345
+	var (
+		seq       uint32
+		sent      uint64
+		completed uint64
+		bytes     uint64
 	)
 
-	fmt.Fprintf(os.Stderr,
-		"bound AF_XDP socket: ifindex=%d zerocopy=%t\n",
-		ifaceIndex, sock.IsZerocopy())
+	addrs := make([]uint64, 0, 128)
+	lens := make([]uint32, 0, 128)
 
 	start := time.Now()
 
-	var (
-		seq   uint32
-		sent  uint64
-		bytes uint64
-		batch uint32
-	)
-
-	const batchSize = 64
-
 	for sent < *fCount {
-		frame := sock.NextFrame()
-		if frame.Buf == nil {
-			sock.PollCompletions(64)
-			continue
+
+		// wait for space
+		for {
+			if sock.TxFree() > 0 && sock.FreeFrames() > 0 {
+				break
+			}
+			// reclaim anything that completed
+			if c := sock.PollCompletions(128); c > 0 {
+				completed += uint64(c)
+				continue
+			}
+			// NIC not progressing yet → wait for progress
+			_ = sock.Wait(1) // ignore errors for now
 		}
 
-		length := buildUDPPacket(
-			frame.Buf,
-			srcMAC[:],
-			fDestMAC,
-			fSrcIP,
-			fDestIP,
-			12345,
-			uint16(*fPort),
-			seq,
-			uint32(*fPktSize),
-		)
+		sendable := sock.TxFree()
+		if sendable > sock.FreeFrames() {
+			sendable = sock.FreeFrames()
+		}
+		if sendable > 128 {
+			sendable = 128
+		}
 
-		must(sock.Submit(frame.Addr, length))
+		if sent+uint64(sendable) > *fCount {
+			sendable = uint32(*fCount - sent)
+		}
 
-		sent++
-		bytes += uint64(length)
-		seq++
-		batch++
+		addrs = addrs[:0]
+		lens = lens[:0]
 
-		if batch == batchSize {
-			must(sock.FlushTx())
-			batch = 0
+		for i := uint32(0); i < sendable; i++ {
+			frame := sock.NextFrame()
+			plen := buildUDPPacket(
+				frame.Buf,
+				srcMAC[:],
+				dstMAC,
+				srcIP,
+				dstIP,
+				dstPort,
+				uint16(*fPort),
+				seq,
+				uint32(*fPktSize),
+			)
+			addrs = append(addrs, frame.Addr)
+			lens = append(lens, plen)
+
+			seq++
+			sent++
+			bytes += uint64(plen)
+		}
+
+		n, err := sock.SubmitBatch(addrs, lens)
+		must(err)
+		must(sock.FlushTx())
+
+		// reclaim what completed from this batch
+		if c := sock.PollCompletions(uint32(n)); c > 0 {
+			completed += uint64(c)
 		}
 	}
 
-	if batch > 0 {
-		must(sock.FlushTx())
+	// drain completions: wait until all sent packets are completed
+	for completed < sent {
+		if c := sock.PollCompletions(128); c > 0 {
+			completed += uint64(c)
+			continue
+		}
+		// nothing new yet, let NIC progress
+		_ = sock.Wait(1)
 	}
 
 	elapsed := time.Since(start)
-
 	pps := float64(sent) / elapsed.Seconds()
-	bps := float64(bytes*8) / elapsed.Seconds()
-	bytesPerSec := float64(bytes) / elapsed.Seconds()
 
 	fmt.Fprintf(os.Stderr,
-		"finished: packets=%s | duration=%s | rate=%s pps | %.2f Mbit/s (%s/s)\n",
+		"finished: sent=%s completed=%s bytes=%s | duration=%s | rate=%s pps\n",
 		humanize.Comma(int64(sent)),
+		humanize.Comma(int64(completed)),
+		humanize.Bytes(bytes),
 		elapsed,
 		humanize.Comma(int64(pps)),
-		bps/1e6,
-		humanize.Bytes(uint64(bytesPerSec)),
 	)
 }

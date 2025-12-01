@@ -61,17 +61,13 @@ func main() {
 				panic(fmt.Sprintf("queue %d: %v", queueID, err))
 			}
 			defer sock.Close()
-			mode := "copy"
-			if sock.IsZerocopy() {
-				mode = "zerocopy"
-			}
-			fmt.Fprintf(os.Stderr, "socket %p on queue %d (mode=%s)\n", sock, qid, mode)
+			fmt.Fprintf(os.Stderr, "socket %p on queue %d (zerocopy=%t)\n",
+				sock, qid, sock.IsZerocopy())
+
+			bufFrames := make([]afxdp.Frame, 64)
 
 			for {
-				frames, err := sock.Receive(64)
-				if err != nil {
-					panic(err)
-				}
+				frames := sock.Receive(bufFrames)
 				if len(frames) == 0 {
 					if err := sock.Wait(waitTimeoutMS); err != nil {
 						panic(err)

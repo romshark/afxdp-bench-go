@@ -250,9 +250,7 @@ func runReceiverBenchmark(
 
 	for _, qid := range qs {
 		q := qid
-		done.Add(1)
-		go func() {
-			defer done.Done()
+		done.Go(func() {
 			runtime.LockOSThread()
 			defer runtime.UnlockOSThread()
 
@@ -271,10 +269,10 @@ func runReceiverBenchmark(
 				ifaceName, q, sock.IsZerocopy())
 			wgReady.Done()
 
-			buf := make([]afxdp.Frame, batch)
+			batch := make([]afxdp.Frame, batch)
 
 			for ctx.Err() == nil {
-				frames := sock.Receive(buf)
+				frames := sock.Receive(batch)
 				if len(frames) == 0 {
 					fatalIf(sock.Wait(1), "RX wait")
 					continue
@@ -287,7 +285,7 @@ func runReceiverBenchmark(
 
 				sock.ReleaseBatch(frames)
 			}
-		}()
+		})
 	}
 
 	wgReady.Wait()
@@ -295,7 +293,7 @@ func runReceiverBenchmark(
 }
 
 type TestResult struct {
-	Received uint64
+	Received atomic.Uint64
 	Errors   atomic.Uint64
 }
 
@@ -304,6 +302,7 @@ func runReceiverTest(
 	iface *afxdp.Interface,
 	conf *Config,
 	result *TestResult,
+	stats *Stats,
 ) (done *sync.WaitGroup) {
 
 	qs, err := iface.RXQueueIDs()
@@ -335,11 +334,7 @@ func runReceiverTest(
 
 	for _, qid := range qs {
 		q := qid
-		done.Add(1)
-
-		go func() {
-			defer done.Done()
-
+		done.Go(func() {
 			runtime.LockOSThread()
 			defer runtime.UnlockOSThread()
 
@@ -370,7 +365,6 @@ func runReceiverTest(
 				}
 
 				for _, fr := range frames {
-
 					buf := fr.Buf
 					if len(buf) < 14+20+8+4 {
 						continue
@@ -421,15 +415,18 @@ func runReceiverTest(
 					}
 
 					nextSeq.Add(1)
-					result.Received++
-					if result.Received == expectedCount {
+					received := result.Received.Add(1)
+					stats.RxPackets.Add(1)
+					stats.RxBytes.Add(uint64(len(fr.Buf)))
+
+					if received == expectedCount {
 						return
 					}
 				}
 
 				sock.ReleaseBatch(frames)
 			}
-		}()
+		})
 	}
 
 	wgReady.Wait()
@@ -449,15 +446,13 @@ func equal(a, b []byte) bool {
 }
 
 func equalMAC(a []byte, b net.HardwareAddr) bool {
-	if len(a) != 6 || len(b) != 6 {
-		return false
-	}
-	for i := 0; i < 6; i++ {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return len(a) == 6 && len(b) == 6 &&
+		a[0] == b[0] &&
+		a[1] == b[1] &&
+		a[2] == b[2] &&
+		a[3] == b[3] &&
+		a[4] == b[4] &&
+		a[5] == b[5]
 }
 
 type SenderConfig struct {
@@ -649,7 +644,7 @@ func runTest(ifaceI, ifaceE *afxdp.Interface, conf *Config, stats *Stats) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	wgRecvDone := runReceiverTest(ctx, ifaceI, conf, &result)
+	wgRecvDone := runReceiverTest(ctx, ifaceI, conf, &result, stats)
 
 	{
 		d := 300 * time.Millisecond
@@ -684,10 +679,8 @@ func runTest(ifaceI, ifaceE *afxdp.Interface, conf *Config, stats *Stats) {
 			result.Errors.Load())
 		os.Exit(1)
 	}
-	if result.Received != conf.Count {
-		fmt.Fprintf(os.Stderr,
-			"TEST FAILED: received %d of %d\n",
-			result.Received, conf.Count)
+	if received := result.Received.Load(); received != conf.Count {
+		fmt.Fprintf(os.Stderr, "TEST FAILED: received %d of %d\n", received, conf.Count)
 		os.Exit(1)
 	}
 

@@ -707,7 +707,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		prod := atomic.LoadUint32(fqQ.prod)
 
 		// Use the first ringSize frames from UMEM for RX.
-		for i := uint32(0); i < ringSize; i++ {
+		for i := range ringSize {
 			idx := (prod + i) & fqQ.mask
 			fqQ.addrs[idx] = uint64(i) * uint64(conf.FrameSize)
 		}
@@ -753,7 +753,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 
 	// Local free-frame pool.
 	freeFrames := make([]uint64, conf.NumFrames)
-	for i := uint32(0); i < conf.NumFrames; i++ {
+	for i := range conf.NumFrames {
 		freeFrames[i] = uint64(i) * uint64(conf.FrameSize)
 	}
 

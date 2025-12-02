@@ -111,7 +111,7 @@ func MakeInterface(iface string, conf InterfaceConfig) (*Interface, error) {
 	}
 
 	// prefer driver mode always; zerocopy is decided per-socket
-	l, objs, err := attachXDP(iface, true)
+	l, objs, err := attachXDP(iface)
 	if err != nil {
 		return nil, fmt.Errorf("attaching XDP program: %w", err)
 	}
@@ -179,7 +179,7 @@ func registerXSK(objs *xdp.XdpProgObjects, fd int, queue uint32) error {
 
 // attachXDP loads and attaches the XDP program to the interface.
 // When zerocopy is true, driver mode is requested to enable AF_XDP zero-copy.
-func attachXDP(ifaceName string, preferDrv bool) (link.Link, *xdp.XdpProgObjects, error) {
+func attachXDP(ifaceName string) (link.Link, *xdp.XdpProgObjects, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("getting interface index by name: %w", err)
@@ -671,7 +671,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		return nil, fmt.Errorf("mmap RX ring: %w", err)
 	}
 
-	// Map FQ ring (UMEM fill ring, uint64 addresses) – populated only for zerocopy.
+	// Map FQ ring (UMEM fill ring, uint64 addresses)
 	fqRegionLen := uintptr(offs.Fr.Desc) + uintptr(conf.RxSize)*unsafe.Sizeof(uint64(0))
 	fqRegion, err := mmapRegion(fd, fqRegionLen, unix.XDP_UMEM_PGOFF_FILL_RING)
 	if err != nil {

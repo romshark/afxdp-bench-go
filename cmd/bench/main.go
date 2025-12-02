@@ -31,11 +31,13 @@ type Config struct {
 		DstIP     string `yaml:"dst-ip"`
 		SrcPort   int    `yaml:"src-port"`
 		DstPort   int    `yaml:"dst-port"`
+		BatchSize uint32 `yaml:"batch-size"`
 	} `yaml:"egress"`
 
 	Ingress struct {
 		Interface string `yaml:"interface"`
 		Zerocopy  bool   `yaml:"zerocopy"`
+		BatchSize uint32 `yaml:"batch-size"`
 	} `yaml:"ingress"`
 
 	MTU   uint64 `yaml:"mtu"`
@@ -52,7 +54,7 @@ func loadConfig() (*Config, error) {
 	fDstIP := flag.String("D", "", "dst ip")
 	fPort := flag.Int("p", 0, "dst udp port")
 	fCount := flag.Uint64("n", 0, "packet count")
-	fPktSize := flag.Uint("l", 1360, "pkt size")
+	fPktSize := flag.Uint("l", 1500, "pkt size")
 	fQueue := flag.Uint("q", 0, "queue id")
 
 	flag.Parse()
@@ -91,7 +93,7 @@ func loadConfig() (*Config, error) {
 	if *fQueue != 0 {
 		conf.Egress.Queue = *fQueue
 	}
-	if *fPktSize != 1360 {
+	if *fPktSize != 1500 {
 		conf.MTU = uint64(*fPktSize)
 	}
 	if *fCount != 0 {
@@ -224,8 +226,8 @@ type Stats struct {
 }
 
 func runReceiver(
-	ctx context.Context, iface *afxdp.Interface, stats *Stats, batchSize int,
-) {
+	ctx context.Context, iface *afxdp.Interface, stats *Stats, batchSize uint32,
+) (done *sync.WaitGroup) {
 	queues, err := iface.RXQueueIDs()
 	fatalIf(err, "listing RX queues")
 	if len(queues) == 0 {
@@ -234,19 +236,27 @@ func runReceiver(
 	ifaceName, _ := iface.Info()
 
 	var wg sync.WaitGroup
+	var wgReady sync.WaitGroup
+	wgReady.Add(len(queues))
 	for _, qid := range queues {
 		q := qid
 		wg.Go(func() {
 			runtime.LockOSThread()
 
 			sock, err := iface.Open(afxdp.SocketConfig{
-				QueueID: q,
+				QueueID:   q,
+				NumFrames: 1024 * 32,
+				RxSize:    1024 * 8,
+				TxSize:    1024 * 8,
+				CqSize:    1024 * 8,
+				BatchSize: batchSize,
 			})
 			fatalIf(err, "opening RX socket")
 			defer sock.Close()
 
 			fmt.Fprintf(os.Stderr, "RX on %s:%d (zerocopy=%t)\n",
 				ifaceName, q, sock.IsZerocopy())
+			wgReady.Done()
 
 			buf := make([]afxdp.Frame, batchSize)
 
@@ -268,7 +278,8 @@ func runReceiver(
 		})
 	}
 
-	wg.Wait()
+	wgReady.Wait()
+	return &wg
 }
 
 type SenderConfig struct {
@@ -284,7 +295,7 @@ type SenderConfig struct {
 	ZC      bool
 }
 
-func runSender(iface *afxdp.Interface, conf *SenderConfig, stats *Stats) {
+func runSender(iface *afxdp.Interface, conf *SenderConfig, stats *Stats, batchSize uint32) {
 	_, srcMAC := mustGetIfaceInfo(conf.Iface)
 
 	dstMAC, err := net.ParseMAC(conf.DstMAC)
@@ -295,10 +306,11 @@ func runSender(iface *afxdp.Interface, conf *SenderConfig, stats *Stats) {
 
 	sock, err := iface.Open(afxdp.SocketConfig{
 		QueueID:   uint32(conf.Queue),
-		FrameSize: 2048,
-		NumFrames: 8192,
-		TxSize:    2048,
-		CqSize:    2048,
+		NumFrames: 1024 * 32,
+		RxSize:    1024 * 8,
+		TxSize:    1024 * 8,
+		CqSize:    1024 * 8,
+		BatchSize: batchSize,
 	})
 	fatalIf(err, "open TX socket")
 	defer sock.Close()
@@ -307,13 +319,6 @@ func runSender(iface *afxdp.Interface, conf *SenderConfig, stats *Stats) {
 	fmt.Fprintf(os.Stderr, "TX on %s:%d (zerocopy=%t)\n",
 		ifaceName, conf.Queue, sock.IsZerocopy())
 
-	fmt.Fprintf(os.Stderr,
-		"TX: egress-if=%s q=%d dst=%s srcIP=%s dstIP=%s port=%d count=%d zerocopy=%t\n",
-		conf.Iface, conf.Queue, dstMAC, srcIP, dstIP, conf.Port, conf.Count,
-		sock.IsZerocopy(),
-	)
-
-	const batchSize = 128
 	addrs := make([]uint64, 0, batchSize)
 	lens := make([]uint32, 0, batchSize)
 	var seq uint32
@@ -386,6 +391,13 @@ func main() {
 	conf, err := loadConfig()
 	fatalIf(err, "reading config")
 
+	// Print final resolved config and exit if requested
+	fmt.Fprintf(os.Stderr, "FINAL CONFIG:\n")
+	b, err := yaml.Marshal(conf)
+	fatalIf(err, "encoding final YAML config")
+	_, _ = os.Stderr.Write(b)
+	fmt.Fprintln(os.Stderr)
+
 	ifaceE, err := afxdp.MakeInterface(
 		conf.Egress.Interface, afxdp.InterfaceConfig{
 			PreferZerocopy: conf.Egress.Zerocopy,
@@ -441,10 +453,7 @@ func main() {
 	ctxRecv, cancelRecv := context.WithCancel(context.Background())
 	defer cancelRecv()
 
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		runReceiver(ctxRecv, ifaceI, &stats, afxdp.DefaultBatchSize)
-	})
+	wgRecvDone := runReceiver(ctxRecv, ifaceI, &stats, conf.Ingress.BatchSize)
 
 	{
 		d := 300 * time.Millisecond
@@ -463,7 +472,7 @@ func main() {
 		PktSize: uint(conf.MTU),
 		Queue:   conf.Egress.Queue,
 		ZC:      conf.Egress.Zerocopy,
-	}, &stats)
+	}, &stats, conf.Egress.BatchSize)
 
 	{
 		d := 300 * time.Millisecond
@@ -471,7 +480,7 @@ func main() {
 		time.Sleep(d) // Wait for all packets to arrive at RX.
 	}
 	cancelRecv()
-	wg.Wait()
+	wgRecvDone.Wait()
 
 	txPackets := stats.TxPackets.Load()
 	rxPackets := stats.RxPackets.Load()
@@ -493,8 +502,8 @@ func main() {
 	p.Printf(" RX:                %d packets\n", rxPackets)
 	p.Printf(" TX Avg PPS:        %d\n", txAvgPPS)
 	p.Printf(" RX Avg PPS:        %d\n", rxAvgPPS)
-	p.Printf(" TX Avg Mbps:       %.1f\n", txAvgMbps)
-	p.Printf(" RX Avg Mbps:       %.1f\n", rxAvgMbps)
+	p.Printf(" TX Avg rate:       %.1f Mbps\n", txAvgMbps)
+	p.Printf(" RX Avg rate:       %.1f Mbps\n", rxAvgMbps)
 	p.Printf(" Dropped:           %d (%.4f%%)\n",
 		drops, float64(drops)/float64(txPackets)*100)
 }

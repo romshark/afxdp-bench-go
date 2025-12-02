@@ -57,6 +57,8 @@ type SocketConfig struct {
 	// CqSize sets the number of entries in the completion ring.
 	CqSize uint32
 	// BatchSize controls TX and completion processing batch size.
+	// Very large values do not help and can hurt copy-mode performance,
+	// so we clamp them in ValidateAndSetDefaults.
 	BatchSize uint32
 }
 
@@ -68,7 +70,7 @@ func (c *SocketConfig) ValidateAndSetDefaults() error {
 		c.FrameSize = DefaultFrameSize
 	}
 	if c.RxSize == 0 {
-		c.RxSize = DefaultTxQueueSize
+		c.RxSize = DefaultRxQueueSize
 	}
 	if c.TxSize == 0 {
 		c.TxSize = DefaultTxQueueSize
@@ -78,6 +80,11 @@ func (c *SocketConfig) ValidateAndSetDefaults() error {
 	}
 	if c.BatchSize == 0 {
 		c.BatchSize = DefaultBatchSize
+	}
+	// Hard upper bound: larger batches cause latency spikes and bad behavior
+	// in copy-mode; AF_XDP works best with modest batches.
+	if c.BatchSize > 256 {
+		c.BatchSize = 256
 	}
 	if c.NumFrames < c.TxSize+c.RxSize {
 		return ErrNumFramesTooSmall
@@ -97,6 +104,10 @@ type Interface struct {
 	objs *xdp.XdpProgObjects
 }
 
+func (i *Interface) Info() (name string, index int) {
+	return i.ifaceName, i.ifaceIndex
+}
+
 // MakeInterface attaches the XDP program to the given interface name
 // and returns an Interface handle that can open AF_XDP sockets on its queues.
 // The XDP program is attached once per Interface.
@@ -106,7 +117,8 @@ func MakeInterface(iface string, conf InterfaceConfig) (*Interface, error) {
 		return nil, fmt.Errorf("getting interface: %w", err)
 	}
 
-	l, objs, err := attachXDP(iface, conf.PreferZerocopy)
+	// prefer driver mode always; zerocopy is decided per-socket
+	l, objs, err := attachXDP(iface)
 	if err != nil {
 		return nil, fmt.Errorf("attaching XDP program: %w", err)
 	}
@@ -174,7 +186,7 @@ func registerXSK(objs *xdp.XdpProgObjects, fd int, queue uint32) error {
 
 // attachXDP loads and attaches the XDP program to the interface.
 // When zerocopy is true, driver mode is requested to enable AF_XDP zero-copy.
-func attachXDP(ifaceName string, zerocopy bool) (link.Link, *xdp.XdpProgObjects, error) {
+func attachXDP(ifaceName string) (link.Link, *xdp.XdpProgObjects, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("getting interface index by name: %w", err)
@@ -194,16 +206,18 @@ func attachXDP(ifaceName string, zerocopy bool) (link.Link, *xdp.XdpProgObjects,
 	opts := link.XDPOptions{
 		Program:   prog,
 		Interface: iface.Index,
-	}
-	if zerocopy {
-		// Request driver-mode XDP for zerocopy.
-		opts.Flags = link.XDPDriverMode
+		Flags:     link.XDPDriverMode, // always try driver mode
 	}
 
 	l, err := link.AttachXDP(opts)
 	if err != nil {
-		objs.Close()
-		return nil, nil, fmt.Errorf("attaching XDP: %w", err)
+		// fallback: generic mode (slower, but works)
+		opts.Flags = 0
+		l, err = link.AttachXDP(opts)
+		if err != nil {
+			objs.Close()
+			return nil, nil, fmt.Errorf("attaching XDP: %w", err)
+		}
 	}
 
 	return l, &objs, nil
@@ -484,8 +498,7 @@ func umemNbAvail(q *xdpUMemQueue, nb uint32) uint32 {
 // and advances the consumer index.
 func umemCompleteFromKernel(q *xdpUMemQueue, dst []uint64, nb uint32) uint32 {
 	entries := umemNbAvail(q, nb)
-	var i uint32
-	for i = range entries {
+	for i := range entries {
 		idx := q.cachedCons & q.mask
 		dst[i] = q.addrs[idx]
 		q.cachedCons++
@@ -537,6 +550,18 @@ type Socket struct {
 	iface *Interface
 
 	fqRegion []byte
+}
+
+// TxFree returns the number of free TX descriptors in the TX ring.
+func (s *Socket) TxFree() uint32 {
+	// cons = kernel consumer index
+	cons := atomic.LoadUint32(s.tx.cons) + s.tx.size
+	return cons - s.tx.cachedProd
+}
+
+// FreeFrames returns number of free UMEM frames available for TX.
+func (s *Socket) FreeFrames() uint32 {
+	return s.freeCount
 }
 
 // Open creates and initializes an AF_XDP socket.
@@ -652,7 +677,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		return nil, fmt.Errorf("mmap RX ring: %w", err)
 	}
 
-	// Map FQ ring (UMEM fill ring, uint64 addresses) – populated only for zerocopy.
+	// Map FQ ring (UMEM fill ring, uint64 addresses)
 	fqRegionLen := uintptr(offs.Fr.Desc) + uintptr(conf.RxSize)*unsafe.Sizeof(uint64(0))
 	fqRegion, err := mmapRegion(fd, fqRegionLen, unix.XDP_UMEM_PGOFF_FILL_RING)
 	if err != nil {
@@ -682,7 +707,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		prod := atomic.LoadUint32(fqQ.prod)
 
 		// Use the first ringSize frames from UMEM for RX.
-		for i := uint32(0); i < ringSize; i++ {
+		for i := range ringSize {
 			idx := (prod + i) & fqQ.mask
 			fqQ.addrs[idx] = uint64(i) * uint64(conf.FrameSize)
 		}
@@ -728,7 +753,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 
 	// Local free-frame pool.
 	freeFrames := make([]uint64, conf.NumFrames)
-	for i := uint32(0); i < conf.NumFrames; i++ {
+	for i := range conf.NumFrames {
 		freeFrames[i] = uint64(i) * uint64(conf.FrameSize)
 	}
 
@@ -826,37 +851,35 @@ func (s *Socket) Wait(timeoutMS int) error {
 	}
 }
 
-// Receive retrieves up to max frames from the RX ring.
+// Receive retrieves up to len(buffer) frames from the RX ring.
 // Returned frames reference UMEM and must be returned via Release.
-func (s *Socket) Receive(max uint32) ([]Frame, error) {
-	var frames []Frame
-
+func (s *Socket) Receive(buffer []Frame) []Frame {
 	avail := rxAvailable(s.rx)
 	if avail == 0 {
-		return nil, nil
+		return nil
 	}
 
-	if avail > max {
+	if max := uint32(len(buffer)); avail > max {
 		avail = max
 	}
+	n := int(avail)
+	buffer = buffer[:n]
 
-	for i := uint32(0); i < avail; i++ {
+	for i := range avail {
 		idx := s.rx.cachedCons & s.rx.mask
 		d := s.rx.descs[idx]
 
 		start := int(d.Addr)
 		end := start + int(d.Len)
 
-		frames = append(frames, Frame{
-			Buf:  s.umem[start:end],
-			Addr: d.Addr,
-		})
+		buffer[i].Buf = s.umem[start:end]
+		buffer[i].Addr = d.Addr
 
 		s.rx.cachedCons++
 	}
 
 	atomic.StoreUint32(s.rx.cons, s.rx.cachedCons)
-	return frames, nil
+	return buffer
 }
 
 // Release returns a received frame to the fill queue for reuse.
@@ -870,6 +893,17 @@ func (s *Socket) Release(frame Frame) error {
 	atomic.StoreUint32(s.fq.prod, prod+1)
 
 	return nil
+}
+
+// ReleaseBatch returns a batch of received frames to the fill queue for reuse.
+func (s *Socket) ReleaseBatch(frames []Frame) {
+	prod := atomic.LoadUint32(s.fq.prod)
+	for _, fr := range frames {
+		idx := prod & s.fq.mask
+		s.fq.addrs[idx] = fr.Addr
+		prod++
+	}
+	atomic.StoreUint32(s.fq.prod, prod)
 }
 
 // Frame represents a borrowed UMEM frame from an AF_XDP socket.
@@ -934,6 +968,35 @@ func (s *Socket) Submit(addr uint64, length uint32) error {
 	d.Len = length
 	d.Opts = 0
 	return nil
+}
+
+// SubmitBatch publishes a batch of frames to the TX ring.
+func (s *Socket) SubmitBatch(addrs []uint64, lens []uint32) (int, error) {
+	n := len(addrs)
+	if n == 0 {
+		return 0, nil
+	}
+
+	var idx uint32
+retry:
+	if reserveTx(s.tx, uint32(n), &idx) == 0 {
+		if s.PollCompletions(s.conf.BatchSize) == 0 {
+			if err := wakeupTxQueue(s.fd); err != nil {
+				return 0, err
+			}
+		}
+		goto retry
+	}
+
+	base := idx & s.tx.mask
+	for i := range n {
+		d := &s.tx.descs[(base+uint32(i))&s.tx.mask]
+		d.Addr = addrs[i]
+		d.Len = lens[i]
+		d.Opts = 0
+	}
+
+	return n, nil
 }
 
 // FlushTx notifies the kernel/NIC that TX descriptors are available.

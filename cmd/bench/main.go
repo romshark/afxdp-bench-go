@@ -316,8 +316,7 @@ func runReceiverTest(
 
 	// Parse config params for filtering
 	dstMAC, _ := net.ParseMAC(conf.Egress.DestMAC)
-	srcMACIdx, srcMAC := mustGetIfaceInfo(conf.Egress.Interface)
-	_ = srcMACIdx
+	_, srcMAC := mustGetIfaceInfo(conf.Egress.Interface)
 	srcIP := net.ParseIP(conf.Egress.SrcIP).To4()
 	dstIP := net.ParseIP(conf.Egress.DstIP).To4()
 	srcPort := uint16(conf.Egress.SrcPort)

@@ -607,10 +607,15 @@ func main() {
 	}
 
 	// Run benchmark.
+	runBenchmark(ifaceI, ifaceE, conf, &stats)
+}
+
+func runBenchmark(ifaceI, ifaceE *afxdp.Interface, conf *Config, stats *Stats) {
+	// Run benchmark.
 	ctxRecv, cancelRecv := context.WithCancel(context.Background())
 	defer cancelRecv()
 
-	wgRecvDone := runReceiverBenchmark(ctxRecv, ifaceI, &stats, conf.Ingress.BatchSize)
+	wgRecvDone := runReceiverBenchmark(ctxRecv, ifaceI, stats, conf.Ingress.BatchSize)
 
 	{
 		d := 300 * time.Millisecond
@@ -629,35 +634,13 @@ func main() {
 		PktSize: uint(conf.MTU),
 		Queue:   conf.Egress.Queue,
 		ZC:      conf.Egress.Zerocopy,
-	}, &stats, conf.Egress.BatchSize)
+	}, stats, conf.Egress.BatchSize)
 
 	time.Sleep(300 * time.Millisecond)
 	cancelRecv()
 	wgRecvDone.Wait()
 
-	txPackets := stats.TxPackets.Load()
-	rxPackets := stats.RxPackets.Load()
-	txBytes := stats.TxBytes.Load()
-	rxBytes := stats.RxBytes.Load()
-
-	drops := txPackets - rxPackets
-	elapsed := float64(stats.Elapsed.Load()) / 1e9
-	txAvgPPS := uint64(float64(txPackets) / elapsed)
-	rxAvgPPS := uint64(float64(rxPackets) / elapsed)
-	txAvgMbps := float64(txBytes*8) / 1e6 / elapsed
-	rxAvgMbps := float64(rxBytes*8) / 1e6 / elapsed
-
-	p := message.NewPrinter(language.English)
-	p.Print("\nFINAL REPORT\n")
-	p.Printf(" Elapsed:           %.3f s\n", elapsed)
-	p.Printf(" TX:                %d packets\n", txPackets)
-	p.Printf(" RX:                %d packets\n", rxPackets)
-	p.Printf(" TX Avg PPS:        %d\n", txAvgPPS)
-	p.Printf(" RX Avg PPS:        %d\n", rxAvgPPS)
-	p.Printf(" TX Avg rate:       %.1f Mbps\n", txAvgMbps)
-	p.Printf(" RX Avg rate:       %.1f Mbps\n", rxAvgMbps)
-	p.Printf(" Dropped:           %d (%.4f%%)\n",
-		drops, float64(drops)/float64(txPackets)*100)
+	printFinalReport(stats)
 }
 
 func runTest(ifaceI, ifaceE *afxdp.Interface, conf *Config, stats *Stats) {
@@ -709,6 +692,7 @@ func runTest(ifaceI, ifaceE *afxdp.Interface, conf *Config, stats *Stats) {
 	}
 
 	fmt.Fprintf(os.Stderr, "TEST PASSED: received all %d packets in order\n", conf.Count)
+	printFinalReport(stats)
 }
 
 func runStatsPrinter(stats *Stats) {
@@ -749,4 +733,30 @@ func runStatsPrinter(stats *Stats) {
 			txPkts, rxPkts, txPPS, rxPPS, txMbps, rxMbps,
 		)
 	}
+}
+
+func printFinalReport(stats *Stats) {
+	txPackets := stats.TxPackets.Load()
+	rxPackets := stats.RxPackets.Load()
+	txBytes := stats.TxBytes.Load()
+	rxBytes := stats.RxBytes.Load()
+
+	drops := txPackets - rxPackets
+	elapsed := float64(stats.Elapsed.Load()) / 1e9
+	txAvgPPS := uint64(float64(txPackets) / elapsed)
+	rxAvgPPS := uint64(float64(rxPackets) / elapsed)
+	txAvgMbps := float64(txBytes*8) / 1e6 / elapsed
+	rxAvgMbps := float64(rxBytes*8) / 1e6 / elapsed
+
+	p := message.NewPrinter(language.English)
+	p.Print("\nFINAL REPORT\n")
+	p.Printf(" Elapsed:           %.3f s\n", elapsed)
+	p.Printf(" TX:                %d packets\n", txPackets)
+	p.Printf(" RX:                %d packets\n", rxPackets)
+	p.Printf(" TX Avg PPS:        %d\n", txAvgPPS)
+	p.Printf(" RX Avg PPS:        %d\n", rxAvgPPS)
+	p.Printf(" TX Avg rate:       %.1f Mbps\n", txAvgMbps)
+	p.Printf(" RX Avg rate:       %.1f Mbps\n", rxAvgMbps)
+	p.Printf(" Dropped:           %d (%.4f%%)\n",
+		drops, float64(drops)/float64(txPackets)*100)
 }

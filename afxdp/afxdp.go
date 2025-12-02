@@ -57,6 +57,8 @@ type SocketConfig struct {
 	// CqSize sets the number of entries in the completion ring.
 	CqSize uint32
 	// BatchSize controls TX and completion processing batch size.
+	// Very large values do not help and can hurt copy-mode performance,
+	// so we clamp them in ValidateAndSetDefaults.
 	BatchSize uint32
 }
 
@@ -68,7 +70,7 @@ func (c *SocketConfig) ValidateAndSetDefaults() error {
 		c.FrameSize = DefaultFrameSize
 	}
 	if c.RxSize == 0 {
-		c.RxSize = DefaultTxQueueSize
+		c.RxSize = DefaultRxQueueSize
 	}
 	if c.TxSize == 0 {
 		c.TxSize = DefaultTxQueueSize
@@ -78,6 +80,11 @@ func (c *SocketConfig) ValidateAndSetDefaults() error {
 	}
 	if c.BatchSize == 0 {
 		c.BatchSize = DefaultBatchSize
+	}
+	// Hard upper bound: larger batches cause latency spikes and bad behavior
+	// in copy-mode; AF_XDP works best with modest batches.
+	if c.BatchSize > 256 {
+		c.BatchSize = 256
 	}
 	if c.NumFrames < c.TxSize+c.RxSize {
 		return ErrNumFramesTooSmall
@@ -491,8 +498,7 @@ func umemNbAvail(q *xdpUMemQueue, nb uint32) uint32 {
 // and advances the consumer index.
 func umemCompleteFromKernel(q *xdpUMemQueue, dst []uint64, nb uint32) uint32 {
 	entries := umemNbAvail(q, nb)
-	var i uint32
-	for i = range entries {
+	for i := range entries {
 		idx := q.cachedCons & q.mask
 		dst[i] = q.addrs[idx]
 		q.cachedCons++
@@ -856,7 +862,8 @@ func (s *Socket) Receive(buffer []Frame) []Frame {
 	if max := uint32(len(buffer)); avail > max {
 		avail = max
 	}
-	buffer = buffer[:avail]
+	n := int(avail)
+	buffer = buffer[:n]
 
 	for i := range avail {
 		idx := s.rx.cachedCons & s.rx.mask
@@ -868,8 +875,8 @@ func (s *Socket) Receive(buffer []Frame) []Frame {
 		buffer[i].Buf = s.umem[start:end]
 		buffer[i].Addr = d.Addr
 
+		s.rx.cachedCons++
 	}
-	s.rx.cachedCons += avail
 
 	atomic.StoreUint32(s.rx.cons, s.rx.cachedCons)
 	return buffer

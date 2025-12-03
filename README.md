@@ -248,3 +248,9 @@ real    0m44.937s
 user    0m0.001s
 sys     0m0.005s
 ```
+
+## Test Mode
+
+You can run the benchmark in test mode that verifies the order and integrity of all packets.
+I've been able to get 1 billion packets transferred without reordering in zerocopy mode,
+but couldn't reproduce this result in copy-mode.

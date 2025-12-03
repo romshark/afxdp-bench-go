@@ -29,8 +29,8 @@ type Config struct {
 		DestMAC   string `yaml:"dest-mac"`
 		SrcIP     string `yaml:"src-ip"`
 		DstIP     string `yaml:"dst-ip"`
-		SrcPort   int    `yaml:"src-port"`
-		DstPort   int    `yaml:"dst-port"`
+		SrcPort   uint16 `yaml:"src-port"`
+		DstPort   uint16 `yaml:"dst-port"`
 		BatchSize uint32 `yaml:"batch-size"`
 	} `yaml:"egress"`
 
@@ -40,7 +40,7 @@ type Config struct {
 		BatchSize uint32 `yaml:"batch-size"`
 	} `yaml:"ingress"`
 
-	MTU   uint64 `yaml:"mtu"`
+	MTU   uint32 `yaml:"mtu"`
 	Count uint64 `yaml:"count"`
 	Test  bool   `yaml:"test"`
 }
@@ -53,7 +53,7 @@ func loadConfig() (*Config, error) {
 	fDestMAC := flag.String("d", "", "dest mac")
 	fSrcIP := flag.String("s", "", "src ip")
 	fDstIP := flag.String("D", "", "dst ip")
-	fPort := flag.Int("p", 0, "dst udp port")
+	fPort := flag.Uint("p", 0, "dst udp port")
 	fCount := flag.Uint64("n", 0, "packet count")
 	fPktSize := flag.Uint("l", 1500, "pkt size")
 	fQueue := flag.Uint("q", 0, "queue id")
@@ -89,13 +89,13 @@ func loadConfig() (*Config, error) {
 		conf.Egress.DstIP = *fDstIP
 	}
 	if *fPort != 0 {
-		conf.Egress.DstPort = *fPort
+		conf.Egress.DstPort = uint16(*fPort)
 	}
 	if *fQueue != 0 {
 		conf.Egress.Queue = *fQueue
 	}
 	if *fPktSize != 1500 {
-		conf.MTU = uint64(*fPktSize)
+		conf.MTU = uint32(*fPktSize)
 	}
 	if *fCount != 0 {
 		conf.Count = *fCount
@@ -127,12 +127,6 @@ func loadConfig() (*Config, error) {
 	}
 	if net.ParseIP(conf.Egress.DstIP) == nil {
 		return nil, fmt.Errorf("invalid egress.dst-ip %q", conf.Egress.DstIP)
-	}
-	if conf.Egress.DstPort <= 0 || conf.Egress.DstPort > 65535 {
-		return nil, errors.New("egress.dst-port must be 1-65535")
-	}
-	if conf.Egress.SrcPort <= 0 || conf.Egress.SrcPort > 65535 {
-		return nil, errors.New("egress.src-port must be 1-65535")
 	}
 	if conf.Count == 0 {
 		return nil, errors.New("count must be > 0")
@@ -256,10 +250,10 @@ func runReceiverBenchmark(
 
 			sock, err := iface.Open(afxdp.SocketConfig{
 				QueueID:   q,
-				NumFrames: 1024 * 32,
-				RxSize:    1024 * 8,
-				TxSize:    1024 * 8,
-				CqSize:    1024 * 8,
+				NumFrames: 1024 * 8,
+				RxSize:    1024 * 4,
+				TxSize:    1024 * 4,
+				CqSize:    1024 * 4,
 				BatchSize: batch,
 			})
 			fatalIf(err, "opening RX socket")
@@ -339,10 +333,10 @@ func runReceiverTest(
 
 			sock, err := iface.Open(afxdp.SocketConfig{
 				QueueID:   q,
-				NumFrames: 1024 * 32,
-				RxSize:    1024 * 8,
-				TxSize:    1024 * 8,
-				CqSize:    1024 * 8,
+				NumFrames: 1024 * 8,
+				RxSize:    1024 * 4,
+				TxSize:    1024 * 4,
+				CqSize:    1024 * 4,
 				BatchSize: conf.Ingress.BatchSize,
 			})
 			fatalIf(err, "opening RX socket")
@@ -459,10 +453,10 @@ type SenderConfig struct {
 	DstMAC  string
 	SrcIP   string
 	DstIP   string
-	SrcPort int
-	Port    int
+	SrcPort uint16
+	Port    uint16
 	Count   uint64
-	PktSize uint
+	PktSize uint32
 	Queue   uint
 	ZC      bool
 }
@@ -486,10 +480,10 @@ func runSender(
 
 	sock, err := iface.Open(afxdp.SocketConfig{
 		QueueID:   uint32(conf.Queue),
-		NumFrames: 1024 * 32,
-		RxSize:    1024 * 8,
-		TxSize:    1024 * 8,
-		CqSize:    1024 * 8,
+		NumFrames: 1024 * 8,
+		RxSize:    1024 * 4,
+		TxSize:    1024 * 4,
+		CqSize:    1024 * 4,
 		BatchSize: batchSize,
 	})
 	fatalIf(err, "open TX socket")
@@ -504,10 +498,6 @@ func runSender(
 	var seq uint32
 
 	start := time.Now()
-
-	srcPort := uint16(conf.SrcPort)
-	dstPort := uint16(conf.Port)
-	pktSize := uint32(conf.PktSize)
 
 	for stats.TxPackets.Load() < conf.Count {
 
@@ -536,7 +526,7 @@ func runSender(
 
 			plen := buildUDPPacket(
 				f.Buf, srcMAC[:], dstMAC, srcIP, dstIP,
-				srcPort, dstPort, seq, pktSize,
+				conf.SrcPort, conf.Port, seq, conf.PktSize,
 			)
 
 			addrs = append(addrs, f.Addr)
@@ -625,7 +615,7 @@ func runBenchmark(ifaceI, ifaceE *afxdp.Interface, conf *Config, stats *Stats) {
 		SrcPort: conf.Egress.SrcPort,
 		Port:    conf.Egress.DstPort,
 		Count:   conf.Count,
-		PktSize: uint(conf.MTU),
+		PktSize: conf.MTU,
 		Queue:   conf.Egress.Queue,
 		ZC:      conf.Egress.Zerocopy,
 	}, stats, conf.Egress.BatchSize)
@@ -659,7 +649,7 @@ func runTest(ifaceI, ifaceE *afxdp.Interface, conf *Config, stats *Stats) {
 		SrcPort: conf.Egress.SrcPort,
 		Port:    conf.Egress.DstPort,
 		Count:   conf.Count,
-		PktSize: uint(conf.MTU),
+		PktSize: conf.MTU,
 		Queue:   conf.Egress.Queue,
 		ZC:      conf.Egress.Zerocopy,
 	}, stats, conf.Egress.BatchSize)

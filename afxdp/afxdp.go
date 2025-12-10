@@ -232,53 +232,6 @@ const (
 	DefaultBatchSize          = 64 // TX batching
 )
 
-/*---- Kernel structs ----*/
-
-// sockaddr_xdp is defined in linux/if_xdp.h
-// See https://elixir.bootlin.com/linux/v5.15.77/source/include/uapi/linux/if_xdp.h#L32
-type sockaddr_xdp struct {
-	Family       uint16
-	Flags        uint16
-	Ifindex      uint32
-	QueueID      uint32
-	SharedUmemFD uint32
-}
-
-// xdp_ring_offset is defined in linux/if_xdp.h
-// See https://elixir.bootlin.com/linux/v5.15.77/source/include/uapi/linux/if_xdp.h#L43
-type xdp_ring_offset struct {
-	Producer uint64
-	Consumer uint64
-	Desc     uint64
-	Flags    uint64
-}
-
-// xdp_mmap_offsets is defined in linux/if_xdp.h
-// https://elixir.bootlin.com/linux/v5.15.77/source/include/uapi/linux/if_xdp.h#L50
-type xdp_mmap_offsets struct {
-	Rx xdp_ring_offset
-	Tx xdp_ring_offset
-	Fr xdp_ring_offset
-	Cr xdp_ring_offset
-}
-
-// xdp_umem_reg is defined in linux/if_xdp.h
-// See https://elixir.bootlin.com/linux/v5.15.77/source/include/uapi/linux/if_xdp.h#L67
-type xdp_umem_reg struct {
-	Addr      uint64
-	Len       uint64
-	ChunkSize uint32
-	Headroom  uint32
-}
-
-// xdp_desc is defined in linux/if_xdp.h
-// See https://elixir.bootlin.com/linux/v5.15.77/source/include/uapi/linux/if_xdp.h#L103
-type xdp_desc struct {
-	Addr uint64
-	Len  uint32
-	Opts uint32
-}
-
 /*---- Queue wrappers ----*/
 
 // xdpUQueue represents a userspace ring queue backed by shared memory.
@@ -291,7 +244,7 @@ type xdpUQueue struct {
 	size       uint32
 	prod       *uint32
 	cons       *uint32
-	descs      []xdp_desc
+	descs      []unix.XDPDesc
 }
 
 // xdpUMemQueue represents a UMEM address ring (FQ or CQ).
@@ -306,7 +259,7 @@ type xdpUMemQueue struct {
 	addrs      []uint64
 }
 
-func rawBind(fd int, sa *sockaddr_xdp) error {
+func rawBind(fd int, sa *unix.RawSockaddrXDP) error {
 	_, _, e := unix.Syscall(unix.SYS_BIND,
 		uintptr(fd),
 		uintptr(unsafe.Pointer(sa)),
@@ -388,7 +341,7 @@ func mmapUmem(length uintptr) ([]byte, error) {
 
 // makeQueue builds RX/TX user queue from mmap + offsets.
 func makeQueue(
-	region []byte, off xdp_ring_offset, size uint32, isTx bool,
+	region []byte, off unix.XDPRingOffset, size uint32, isTx bool,
 ) (*xdpUQueue, error) {
 	if len(region) == 0 {
 		return nil, ErrTXRegionIsEmpty
@@ -399,7 +352,7 @@ func makeQueue(
 	cons := (*uint32)(unsafe.Add(base, off.Consumer))
 
 	descPtr := unsafe.Add(base, off.Desc)
-	descs := unsafe.Slice((*xdp_desc)(descPtr), size)
+	descs := unsafe.Slice((*unix.XDPDesc)(descPtr), size)
 
 	cachedCons := uint32(0)
 	if isTx {
@@ -419,7 +372,7 @@ func makeQueue(
 
 // makeUMemQueue builds UMEM completion queue from mmap + offsets.
 func makeUMemQueue(
-	region []byte, off xdp_ring_offset, size uint32,
+	region []byte, off unix.XDPRingOffset, size uint32,
 ) (*xdpUMemQueue, error) {
 	if len(region) == 0 {
 		return nil, ErrCQRegionIsEmpty
@@ -594,11 +547,11 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		return nil, fmt.Errorf("mmap UMEM: %w", err)
 	}
 
-	reg := xdp_umem_reg{
-		Addr:      uint64(uintptr(unsafe.Pointer(&umem[0]))),
-		Len:       uint64(len(umem)),
-		ChunkSize: conf.FrameSize,
-		Headroom:  0,
+	reg := unix.XDPUmemReg{
+		Addr:     uint64(uintptr(unsafe.Pointer(&umem[0]))),
+		Len:      uint64(len(umem)),
+		Size:     conf.FrameSize,
+		Headroom: 0,
 	}
 	if err := setsockopt(
 		fd, unix.SOL_XDP, unix.XDP_UMEM_REG,
@@ -647,7 +600,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 	}
 
 	// Query mmap offsets for all rings.
-	var offs xdp_mmap_offsets
+	var offs unix.XDPMmapOffsets
 	if err := getsockopt(
 		fd, unix.SOL_XDP, unix.XDP_MMAP_OFFSETS,
 		unsafe.Pointer(&offs), unsafe.Sizeof(offs),
@@ -657,7 +610,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 	}
 
 	// Map TX ring (descriptors).
-	txRegionLen := uintptr(offs.Tx.Desc) + uintptr(conf.TxSize)*unsafe.Sizeof(xdp_desc{})
+	txRegionLen := uintptr(offs.Tx.Desc) + uintptr(conf.TxSize)*unsafe.Sizeof(unix.XDPDesc{})
 	txRegion, err := mmapRegion(fd, txRegionLen, unix.XDP_PGOFF_TX_RING)
 	if err != nil {
 		return nil, fmt.Errorf("mmap TX ring: %w", err)
@@ -671,7 +624,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 	}
 
 	// Map RX ring
-	rxRegionLen := uintptr(offs.Rx.Desc) + uintptr(conf.RxSize)*unsafe.Sizeof(xdp_desc{})
+	rxRegionLen := uintptr(offs.Rx.Desc) + uintptr(conf.RxSize)*unsafe.Sizeof(unix.XDPDesc{})
 	rxRegion, err := mmapRegion(fd, rxRegionLen, unix.XDP_PGOFF_RX_RING)
 	if err != nil {
 		return nil, fmt.Errorf("mmap RX ring: %w", err)
@@ -719,10 +672,10 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 	}
 
 	// Bind AF_XDP socket to iface:queue.
-	sa := &sockaddr_xdp{
-		Family:  unix.AF_XDP,
-		Ifindex: uint32(iface.Index),
-		QueueID: conf.QueueID,
+	sa := &unix.RawSockaddrXDP{
+		Family:   unix.AF_XDP,
+		Ifindex:  uint32(iface.Index),
+		Queue_id: conf.QueueID,
 	}
 
 	zerocopy := i.preferZerocopy
@@ -966,7 +919,7 @@ func (s *Socket) Submit(addr uint64, length uint32) error {
 	d := &s.tx.descs[idx&s.tx.mask]
 	d.Addr = addr
 	d.Len = length
-	d.Opts = 0
+	d.Options = 0
 	return nil
 }
 
@@ -993,7 +946,7 @@ retry:
 		d := &s.tx.descs[(base+uint32(i))&s.tx.mask]
 		d.Addr = addrs[i]
 		d.Len = lens[i]
-		d.Opts = 0
+		d.Options = 0
 	}
 
 	return n, nil

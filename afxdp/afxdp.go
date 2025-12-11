@@ -514,23 +514,47 @@ func wakeupTxQueue(fd int) error {
 type Socket struct {
 	conf       SocketConfig
 	isZerocopy bool
+	fd         int
 
-	fd int
-
+	// umem is the contiguous UMEM region backing all RX/TX frames.
+	// Both RX and TX rings reference offsets into this slice.
 	umem []byte
-	tx   *xdpUQueue
-	cq   *xdpUMemQueue
-	rx   *xdpUQueue
-	fq   *xdpUMemQueue
 
+	// tx is the TX descriptor ring. Userspace produces
+	// descriptors here; the kernel/NIC consumes them to transmit packets.
+	tx *xdpUQueue
+
+	// cq is the UMEM completion ring. The kernel produces frame addresses
+	// here when TX packets have been sent and their buffers can be reused.
+	cq *xdpUMemQueue
+
+	// rx is the RX descriptor ring. The kernel/NIC produces
+	// descriptors here; userspace consumes them via Receive.
+	rx *xdpUQueue
+
+	// fq is the UMEM fill ring. Userspace produces frame addresses here
+	// to supply fresh buffers for RX; the kernel consumes them.
+	fq *xdpUMemQueue
+
+	// txRegion is the mmaped memory backing the TX ring metadata and descriptor array.
+	// rxRegion is the mmaped memory backing the RX ring metadata and descriptor array.
 	txRegion, rxRegion []byte
+
+	// cqRegion and fqRegion are the mmaped memory regions backing the
+	// COMPLETION and FILL rings respectively.
 	cqRegion, fqRegion []byte
 
+	// freeFrames is the freelist (stack) of UMEM frame addresses dedicated to TX.
+	// len(freeFrames) is the number of currently-free frames; cap(freeFrames)
+	// is the total TX frame pool capacity.
 	freeFrames []uint64
-	freeCount  uint32
 
+	// compBuf is a scratch buffer used when draining the completion ring
+	// in PollCompletions().
 	compBuf []uint64
 
+	// iface is the owning Interface, used for bookkeeping and to keep the
+	// XDP program/eBPF objects alive while the socket is in use.
 	iface *Interface
 }
 
@@ -543,7 +567,7 @@ func (s *Socket) TxFree() uint32 {
 
 // FreeFrames returns number of free UMEM frames available for TX.
 func (s *Socket) FreeFrames() uint32 {
-	return s.freeCount
+	return uint32(len(s.freeFrames))
 }
 
 // Open creates and initializes an AF_XDP socket.
@@ -703,16 +727,13 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 	}
 
 	{ // Populate FQ with initial UMEM frames.
-		ringSize := fqQ.size
 		prod := atomic.LoadUint32(fqQ.prod)
-
-		// Use the first ringSize frames from UMEM for RX.
-		for i := range ringSize {
+		for i := range fqQ.size {
 			idx := (prod + i) & fqQ.mask
 			fqQ.addrs[idx] = uint64(i) * uint64(conf.FrameSize)
 		}
 
-		atomic.StoreUint32(fqQ.prod, prod+ringSize)
+		atomic.StoreUint32(fqQ.prod, prod+fqQ.size)
 		fqQ.cachedProd = atomic.LoadUint32(fqQ.prod)
 		fqQ.cachedCons = atomic.LoadUint32(fqQ.cons)
 	}
@@ -748,13 +769,14 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		return nil, fail("registering XSK: %w", err)
 	}
 
-	// Local free-frame pool.
-	freeFrames := make([]uint64, conf.NumFrames)
-	for i := range conf.NumFrames {
-		freeFrames[i] = uint64(i) * uint64(conf.FrameSize)
+	// Local free-frame pool for TX only: frames [RxSize .. NumFrames-1].
+	freeFrames := make([]uint64, conf.NumFrames-conf.RxSize)
+	for i := range freeFrames {
+		frameIdx := conf.RxSize + uint32(i)
+		freeFrames[i] = uint64(frameIdx) * uint64(conf.FrameSize)
 	}
 
-	s := &Socket{
+	return &Socket{
 		conf:       conf,
 		isZerocopy: zerocopy,
 		fd:         fd,
@@ -768,12 +790,9 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		cqRegion:   cqRegion,
 		fqRegion:   fqRegion,
 		freeFrames: freeFrames,
-		freeCount:  conf.NumFrames,
 		compBuf:    make([]uint64, conf.BatchSize),
 		iface:      i,
-	}
-
-	return s, nil
+	}, nil
 }
 
 // IsZerocopy reports whether the socket is operating in zero-copy mode.
@@ -865,8 +884,7 @@ func (s *Socket) Receive(buffer []Frame) []Frame {
 	if max := uint32(len(buffer)); avail > max {
 		avail = max
 	}
-	n := int(avail)
-	buffer = buffer[:n]
+	buffer = buffer[:avail]
 
 	for i := range avail {
 		idx := s.rx.cachedCons & s.rx.mask
@@ -924,16 +942,17 @@ type Frame struct {
 // A zero-value frame indicates that no frame is currently available and the
 // caller should retry after PollCompletions().
 func (s *Socket) NextFrame() Frame {
-	if s.freeCount == 0 {
+	if len(s.freeFrames) == 0 {
 		// Try to reclaim some completions.
 		s.PollCompletions(uint32(len(s.compBuf)))
-		if s.freeCount == 0 {
+		if len(s.freeFrames) == 0 {
 			return Frame{}
 		}
 	}
 
-	s.freeCount--
-	addr := s.freeFrames[s.freeCount]
+	n := len(s.freeFrames) - 1
+	addr := s.freeFrames[n]
+	s.freeFrames = s.freeFrames[:n]
 
 	frameSize := s.conf.FrameSize
 	if frameSize == 0 {
@@ -1023,8 +1042,9 @@ func (s *Socket) PollCompletions(maxFrames uint32) uint32 {
 
 	n := umemCompleteFromKernel(s.cq, s.compBuf, maxFrames)
 	for i := range n {
-		s.freeFrames[s.freeCount] = s.compBuf[i]
-		s.freeCount++
+		// cap(freeFrames) was pre-allocated to the total TX pool size,
+		// so this will not allocate as long as we don't exceed that.
+		s.freeFrames = append(s.freeFrames, s.compBuf[i])
 	}
 	return n
 }

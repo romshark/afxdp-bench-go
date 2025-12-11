@@ -234,29 +234,57 @@ const (
 
 /*---- Queue wrappers ----*/
 
-// xdpUQueue represents a userspace ring queue backed by shared memory.
-// It mirrors the kernel ring structure and maintains cached producer/consumer
-// indices to reduce atomic traffic.
-type xdpUQueue struct {
+type queuePtrs struct {
+	// cachedProd is the userspace-local copy of the producer index.
+	// We batch-load the real producer index from *prod to reduce
+	// cacheline and atomic operations when checking for available entries.
 	cachedProd uint32
+
+	// cachedCons is the userspace-local copy of the consumer index.
+	// We advance this locally while consuming entries and flush it
+	// back to *cons only after a batch, for the same reasons as with cachedProd.
 	cachedCons uint32
-	mask       uint32
-	size       uint32
-	prod       *uint32
-	cons       *uint32
-	descs      []unix.XDPDesc
+
+	// mask is size-1 and is used for cheap wrapping of ring indices
+	// (idx & mask) instead of a modulo operation. Assumes size is a
+	// power of two, as required by AF_XDP.
+	mask uint32
+
+	// size is the total number of entries in the ring.
+	// It defines the valid index range and the maximum number of
+	// in-flight UMEM addresses the ring can hold.
+	size uint32
+
+	// prod points into the shared ring header producer index in the
+	// mmap'ed region. For completion rings, this is updated by the
+	// kernel; for fill rings, it is updated by userspace.
+	prod *uint32
+
+	// cons points into the shared ring header consumer index in the
+	// mmap'ed region. For completion rings, this is advanced by
+	// userspace as entries are reclaimed; for fill rings, by the kernel.
+	cons *uint32
 }
 
-// xdpUMemQueue represents a UMEM address ring (FQ or CQ).
+// xdpUQueue is conceptually identical to xdpUMemQueue in terms of indexing.
+// The key difference is the payload.
+//   - xdpUQueue: descriptors pointing into UMEM (unix.XDPDesc),
+//   - xdpUMemQueue: bare UMEM frame addresses (uint64) for FILL/COMPLETION.
+type xdpUQueue struct {
+	queuePtrs
+	descs []unix.XDPDesc
+}
+
+// xdpUMemQueue represents a UMEM address ring (FILL or COMPLETION).
 // Entries are raw UMEM offsets managed by kernel and userspace.
+//
+// See https://www.kernel.org/doc/html/latest/networking/af_xdp.html#rings.
 type xdpUMemQueue struct {
-	cachedProd uint32
-	cachedCons uint32
-	mask       uint32
-	size       uint32
-	prod       *uint32
-	cons       *uint32
-	addrs      []uint64
+	queuePtrs
+	// addrs is the ring itself: a power-of-two-sized slice of UMEM
+	// offsets. Each element is the base address of a frame inside the
+	// UMEM area, as seen by both kernel and userspace.
+	addrs []uint64
 }
 
 func rawBind(fd int, sa *unix.RawSockaddrXDP) error {
@@ -360,13 +388,15 @@ func makeQueue(
 	}
 
 	return &xdpUQueue{
-		mask:       size - 1,
-		size:       size,
-		prod:       prod,
-		cons:       cons,
-		descs:      descs,
-		cachedProd: 0,
-		cachedCons: cachedCons,
+		queuePtrs: queuePtrs{
+			mask:       size - 1,
+			size:       size,
+			prod:       prod,
+			cons:       cons,
+			cachedProd: 0,
+			cachedCons: cachedCons,
+		},
+		descs: descs,
 	}, nil
 }
 
@@ -386,13 +416,15 @@ func makeUMemQueue(
 	addrs := unsafe.Slice((*uint64)(addrPtr), size)
 
 	return &xdpUMemQueue{
-		mask:       size - 1,
-		size:       size,
-		prod:       prod,
-		cons:       cons,
-		addrs:      addrs,
-		cachedProd: 0,
-		cachedCons: 0,
+		queuePtrs: queuePtrs{
+			mask:       size - 1,
+			size:       size,
+			prod:       prod,
+			cons:       cons,
+			cachedProd: 0,
+			cachedCons: 0,
+		},
+		addrs: addrs,
 	}, nil
 }
 
@@ -429,7 +461,6 @@ func reserveTx(q *xdpUQueue, nDescs uint32, idx *uint32) int {
 // commitTxDescriptors publishes TX descriptors to the kernel
 // by updating the producer index.
 func commitTxDescriptors(queueProd *uint32, queueCachedProd uint32) {
-	// Descriptors are written; now publish producer index.
 	atomic.StoreUint32(queueProd, queueCachedProd)
 }
 
@@ -492,8 +523,8 @@ type Socket struct {
 	rx   *xdpUQueue
 	fq   *xdpUMemQueue
 
-	txRegion []byte
-	cqRegion []byte
+	txRegion, rxRegion []byte
+	cqRegion, fqRegion []byte
 
 	freeFrames []uint64
 	freeCount  uint32
@@ -501,8 +532,6 @@ type Socket struct {
 	compBuf []uint64
 
 	iface *Interface
-
-	fqRegion []byte
 }
 
 // TxFree returns the number of free TX descriptors in the TX ring.
@@ -526,25 +555,49 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		return nil, err
 	}
 
-	// TODO: currently, Open would leak memory if some of the following
-	// operations fail.
+	var (
+		txRegion, cqRegion, rxRegion, fqRegion, umem []byte
+		fd                                           int
+	)
+
+	fail := func(errf string, a ...any) error {
+		if txRegion != nil {
+			_ = unix.Munmap(txRegion)
+		}
+		if cqRegion != nil {
+			_ = unix.Munmap(cqRegion)
+		}
+		if rxRegion != nil {
+			_ = unix.Munmap(rxRegion)
+		}
+		if fqRegion != nil {
+			_ = unix.Munmap(fqRegion)
+		}
+		if umem != nil {
+			_ = unix.Munmap(umem)
+		}
+		if fd != 0 {
+			_ = unix.Close(fd)
+		}
+		return fmt.Errorf(errf, a...)
+	}
 
 	iface, err := net.InterfaceByName(i.ifaceName)
 	if err != nil {
-		return nil, fmt.Errorf("fetching iface info by name: %w", err)
+		return nil, fail("fetching iface info by name: %w", err)
 	}
 
 	// AF_XDP socket.
-	fd, err := unix.Socket(unix.AF_XDP, unix.SOCK_RAW, 0)
+	fd, err = unix.Socket(unix.AF_XDP, unix.SOCK_RAW, 0)
 	if err != nil {
-		return nil, fmt.Errorf("opening AF_XDP socket: %w", err)
+		return nil, fail("opening AF_XDP socket: %w", err)
 	}
 
 	// UMEM registration.
 	umemLen := uintptr(conf.NumFrames) * uintptr(conf.FrameSize)
-	umem, err := mmapUmem(umemLen)
+	umem, err = mmapUmem(umemLen)
 	if err != nil {
-		return nil, fmt.Errorf("mmap UMEM: %w", err)
+		return nil, fail("mmap UMEM: %w", err)
 	}
 
 	reg := unix.XDPUmemReg{
@@ -557,8 +610,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		fd, unix.SOL_XDP, unix.XDP_UMEM_REG,
 		unsafe.Pointer(&reg), unsafe.Sizeof(reg),
 	); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("setsockopt XDP_UMEM_REG: %w", err)
+		return nil, fail("setsockopt XDP_UMEM_REG: %w", err)
 	}
 
 	// UMEM ring sizes.
@@ -568,15 +620,13 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		fd, unix.SOL_XDP, unix.XDP_UMEM_FILL_RING,
 		unsafe.Pointer(&fillSize), unsafe.Sizeof(fillSize),
 	); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("setsockopt XDP_UMEM_FILL_RING: %w", err)
+		return nil, fail("setsockopt XDP_UMEM_FILL_RING: %w", err)
 	}
 	if err := setsockopt(
 		fd, unix.SOL_XDP, unix.XDP_UMEM_COMPLETION_RING,
 		unsafe.Pointer(&compSize), unsafe.Sizeof(compSize),
 	); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("setsockopt XDP_UMEM_COMPLETION_RING: %w", err)
+		return nil, fail("setsockopt XDP_UMEM_COMPLETION_RING: %w", err)
 	}
 
 	// TX ring size on socket.
@@ -585,8 +635,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		fd, unix.SOL_XDP, unix.XDP_TX_RING,
 		unsafe.Pointer(&txSize), unsafe.Sizeof(txSize),
 	); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("setsockopt XDP_TX_RING: %w", err)
+		return nil, fail("setsockopt XDP_TX_RING: %w", err)
 	}
 
 	// RX ring size on socket.
@@ -595,8 +644,7 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		fd, unix.SOL_XDP, unix.XDP_RX_RING,
 		unsafe.Pointer(&rxSize), unsafe.Sizeof(rxSize),
 	); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("setsockopt XDP_RX_RING: %w", err)
+		return nil, fail("setsockopt XDP_RX_RING: %w", err)
 	}
 
 	// Query mmap offsets for all rings.
@@ -605,54 +653,53 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		fd, unix.SOL_XDP, unix.XDP_MMAP_OFFSETS,
 		unsafe.Pointer(&offs), unsafe.Sizeof(offs),
 	); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("setsockopt XDP_MMAP_OFFSETS: %w", err)
+		return nil, fail("setsockopt XDP_MMAP_OFFSETS: %w", err)
 	}
 
 	// Map TX ring (descriptors).
 	txRegionLen := uintptr(offs.Tx.Desc) + uintptr(conf.TxSize)*unsafe.Sizeof(unix.XDPDesc{})
-	txRegion, err := mmapRegion(fd, txRegionLen, unix.XDP_PGOFF_TX_RING)
+	txRegion, err = mmapRegion(fd, txRegionLen, unix.XDP_PGOFF_TX_RING)
 	if err != nil {
-		return nil, fmt.Errorf("mmap TX ring: %w", err)
+		return nil, fail("mmap TX ring: %w", err)
 	}
 
 	// Map CQ ring (UMEM completion ring, uint64 addresses).
 	cqRegionLen := uintptr(offs.Cr.Desc) + uintptr(conf.CqSize)*unsafe.Sizeof(uint64(0))
-	cqRegion, err := mmapRegion(fd, cqRegionLen, unix.XDP_UMEM_PGOFF_COMPLETION_RING)
+	cqRegion, err = mmapRegion(fd, cqRegionLen, unix.XDP_UMEM_PGOFF_COMPLETION_RING)
 	if err != nil {
-		return nil, fmt.Errorf("mmap CQ ring: %w", err)
+		return nil, fail("mmap CQ ring: %w", err)
 	}
 
 	// Map RX ring
 	rxRegionLen := uintptr(offs.Rx.Desc) + uintptr(conf.RxSize)*unsafe.Sizeof(unix.XDPDesc{})
-	rxRegion, err := mmapRegion(fd, rxRegionLen, unix.XDP_PGOFF_RX_RING)
+	rxRegion, err = mmapRegion(fd, rxRegionLen, unix.XDP_PGOFF_RX_RING)
 	if err != nil {
-		return nil, fmt.Errorf("mmap RX ring: %w", err)
+		return nil, fail("mmap RX ring: %w", err)
 	}
 
 	// Map FQ ring (UMEM fill ring, uint64 addresses)
 	fqRegionLen := uintptr(offs.Fr.Desc) + uintptr(conf.RxSize)*unsafe.Sizeof(uint64(0))
-	fqRegion, err := mmapRegion(fd, fqRegionLen, unix.XDP_UMEM_PGOFF_FILL_RING)
+	fqRegion, err = mmapRegion(fd, fqRegionLen, unix.XDP_UMEM_PGOFF_FILL_RING)
 	if err != nil {
-		return nil, fmt.Errorf("mmap FQ ring: %w", err)
+		return nil, fail("mmap FQ ring: %w", err)
 	}
 
 	// Build queues.
 	txQ, err := makeQueue(txRegion, offs.Tx, conf.TxSize, true)
 	if err != nil {
-		return nil, fmt.Errorf("making TX queue: %w", err)
+		return nil, fail("making TX queue: %w", err)
 	}
 	cqQ, err := makeUMemQueue(cqRegion, offs.Cr, conf.CqSize)
 	if err != nil {
-		return nil, fmt.Errorf("making CQ queue: %w", err)
+		return nil, fail("making CQ queue: %w", err)
 	}
 	rxQ, err := makeQueue(rxRegion, offs.Rx, conf.RxSize, false)
 	if err != nil {
-		return nil, fmt.Errorf("making RX queue: %w", err)
+		return nil, fail("making RX queue: %w", err)
 	}
 	fqQ, err := makeUMemQueue(fqRegion, offs.Fr, conf.RxSize)
 	if err != nil {
-		return nil, fmt.Errorf("making FQ queue: %w", err)
+		return nil, fail("making FQ queue: %w", err)
 	}
 
 	{ // Populate FQ with initial UMEM frames.
@@ -666,7 +713,6 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		}
 
 		atomic.StoreUint32(fqQ.prod, prod+ringSize)
-		// cached indices are not used for FQ anymore
 		fqQ.cachedProd = atomic.LoadUint32(fqQ.prod)
 		fqQ.cachedCons = atomic.LoadUint32(fqQ.cons)
 	}
@@ -695,13 +741,11 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		}
 	}
 	if err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("binding socket: %w", err)
+		return nil, fail("binding socket: %w", err)
 	}
 
 	if err := registerXSK(i.objs, fd, conf.QueueID); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("registering XSK: %w", err)
+		return nil, fail("registering XSK: %w", err)
 	}
 
 	// Local free-frame pool.
@@ -720,12 +764,13 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		rx:         rxQ,
 		fq:         fqQ,
 		txRegion:   txRegion,
+		rxRegion:   rxRegion,
 		cqRegion:   cqRegion,
+		fqRegion:   fqRegion,
 		freeFrames: freeFrames,
 		freeCount:  conf.NumFrames,
 		compBuf:    make([]uint64, conf.BatchSize),
 		iface:      i,
-		fqRegion:   fqRegion,
 	}
 
 	return s, nil
@@ -754,6 +799,12 @@ func (s *Socket) Close() error {
 		}
 		s.txRegion = nil
 	}
+	if s.rxRegion != nil {
+		if err := unix.Munmap(s.rxRegion); err != nil {
+			errs = append(errs, err)
+		}
+		s.rxRegion = nil
+	}
 
 	if s.cqRegion != nil {
 		if err := unix.Munmap(s.cqRegion); err != nil {
@@ -761,7 +812,6 @@ func (s *Socket) Close() error {
 		}
 		s.cqRegion = nil
 	}
-
 	if s.fqRegion != nil {
 		if err := unix.Munmap(s.fqRegion); err != nil {
 			errs = append(errs, err)

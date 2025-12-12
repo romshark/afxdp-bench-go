@@ -6,6 +6,8 @@ IFACE_INGRESS ?= top_2
 
 ZC ?= 0 # Set ZC=1 to enable zerocopy
 
+TIME_CMD := /usr/bin/time -v # Use GNU time for detailed syscall/CPU stats.
+
 define get_stat
 	ethtool -S $(1) | awk -v key="$(2)" '$$1 == key":" { print $$2 }'
 endef
@@ -20,7 +22,8 @@ build-route: gogenerate
 	go build -o route ./cmd/route
 
 run-route: build-route
-	time sudo ./route -n $(COUNT)
+	@echo "---- RUNNING ROUTER BENCHMARK ----"
+	sudo $(TIME_CMD) ./route -n $(COUNT)
 
 run-p2p: build-p2p
 	@echo "COUNT=$(COUNT)"
@@ -36,9 +39,9 @@ run-p2p: build-p2p
 
 	@echo "---- RUN ----"
 	@if [ "$(ZC)" = "1" ]; then \
-		time sudo ./p2p -n $(COUNT) -z; \
+		sudo $(TIME_CMD) ./p2p -n $(COUNT) -z; \
 	else \
-		time sudo ./p2p -n $(COUNT); \
+		sudo $(TIME_CMD) ./p2p -n $(COUNT); \
 	fi
 
 	@echo "---- AFTER ----"

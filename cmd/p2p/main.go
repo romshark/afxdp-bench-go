@@ -46,7 +46,7 @@ type Config struct {
 }
 
 func loadConfig() (*Config, error) {
-	fConfig := flag.String("config", "bench.yaml", "path to config YAML file")
+	fConfig := flag.String("config", "p2p.yaml", "path to config YAML file")
 	fIfaceE := flag.String("ie", "", "egress")
 	fIfaceI := flag.String("ii", "", "ingress")
 	fPreferZC := flag.Bool("z", false, "zerocopy")

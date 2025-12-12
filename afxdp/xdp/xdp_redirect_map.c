@@ -42,7 +42,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
     // - Ethernet header
     // - IPv4 header (ihl must be respected)
     // - UDP header
-    // If the destination port != 9000 → DROP
+    // If the destination port != 9000 -> DROP
 
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;

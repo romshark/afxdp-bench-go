@@ -150,7 +150,7 @@ func main() {
 				completed += uint64(c)
 				continue
 			}
-			// NIC not progressing yet → wait for progress
+			// NIC not progressing yet -> wait for progress
 			_ = sock.Wait(1) // ignore errors for now
 		}
 

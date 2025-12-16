@@ -377,7 +377,6 @@ func runSender(
 	start := time.Now()
 
 	for stats.TxPackets.Load() < conf.Count {
-
 		for {
 			if sock.TxFree() > 0 && sock.FreeFrames() > 0 {
 				break
@@ -397,8 +396,6 @@ func runSender(
 
 		addrs = addrs[:0]
 		lens = lens[:0]
-
-		limiter.ThrottleN(uint64(sendable)) // No-op if unlimited.
 
 		for range sendable {
 			f := sock.NextFrame()
@@ -425,6 +422,7 @@ func runSender(
 		if c := sock.PollCompletions(uint32(n)); c > 0 {
 			stats.TxCompleted.Add(uint64(c))
 		}
+		limiter.ThrottleN(uint64(sendable)) // No-op if unlimited.
 	}
 
 	for stats.TxCompleted.Load() < stats.TxPackets.Load() {

@@ -3,46 +3,48 @@ package ratelimit
 
 import "time"
 
-// Limiter limits to pps packets per second on average.
+// Throttle limits to pps packets per second on average.
 // Not safe for concurrent use.
-type Limiter struct {
-	pps      uint64
-	interval time.Duration
-	next     time.Time
+type Throttle struct {
+	nsPerPacket int64
+	packetsSent uint64
+	startTime   time.Time
+	checkEvery  uint64
 }
 
 // New creates a limiter for pps packets per second.
 // If pps == 0, throttling is disabled.
-func New(pps uint64) *Limiter {
+func New(pps uint64) *Throttle {
 	if pps == 0 {
-		return &Limiter{pps: 0}
+		return nil
 	}
-	interval := time.Second / time.Duration(pps)
-	if interval <= 0 {
-		interval = 1
-	}
-	return &Limiter{
-		pps:      pps,
-		interval: interval,
-		next:     time.Now(),
+	return &Throttle{
+		nsPerPacket: int64(time.Second) / int64(pps),
+		startTime:   time.Now(),
+
+		// Check time every ~10ms of packets to balance accuracy vs overhead
+		// At least every 32 packets. At most every 1024 packets.
+		checkEvery: min(max(pps/100, 32), 1024),
 	}
 }
 
 // ThrottleN blocks until n packets are allowed.
 // It does not "catch up" by allowing faster sends after being delayed.
-func (l *Limiter) ThrottleN(n uint64) {
-	if l.pps == 0 || n == 0 {
+func (l *Throttle) ThrottleN(n uint64) {
+	if l == nil || n == 0 {
 		return
 	}
 
-	now := time.Now()
-	base := now
-	if now.Before(l.next) {
-		time.Sleep(time.Until(l.next))
-		base = l.next
+	l.packetsSent += n
+	if l.packetsSent%l.checkEvery != 0 {
+		return // Fast path: only check time periodically.
 	}
 
-	// Next allowed time after reserving n packets worth of time.
-	// (n is small here; if you ever pass huge n, guard overflow.)
-	l.next = base.Add(time.Duration(n) * l.interval)
+	// Slow path: check if we need to sleep
+	expectedTime := l.startTime.Add(time.Duration(int64(l.packetsSent) * l.nsPerPacket))
+
+	if now := time.Now(); now.Before(expectedTime) {
+		time.Sleep(expectedTime.Sub(now))
+	}
+	// If behind schedule, naturally catch up by not sleeping
 }

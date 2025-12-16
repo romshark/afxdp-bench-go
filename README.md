@@ -18,6 +18,14 @@ sudo apt install -y \
 
 Also install [Go 1.25.4](https://go.dev/).
 
+You may also reserve hugepages (768 pages = ~1.5gb) for improved performance:
+
+```sh
+sudo sysctl -w vm.nr_hugepages=768
+```
+
+The sockets will fall back to regular mmap pages if this isn't done.
+
 ## Results on BlueField-2
 
 The following results were achieved on

@@ -36,16 +36,18 @@ import (
 
 type Config struct {
 	Router struct {
-		Interface1     string `yaml:"interface1"`
-		Interface2     string `yaml:"interface2"`
-		PreferZerocopy bool   `yaml:"prefer-zerocopy"`
-		BatchSize      uint32 `yaml:"batch-size"`
+		Interface1      string `yaml:"interface1"`
+		Interface2      string `yaml:"interface2"`
+		PreferHugepages bool   `yaml:"prefer-hugepages"`
+		PreferZerocopy  bool   `yaml:"prefer-zerocopy"`
+		BatchSize       uint32 `yaml:"batch-size"`
 	} `yaml:"router"`
 
 	Sender struct {
-		Interface      string `yaml:"interface"`
-		PreferZerocopy bool   `yaml:"prefer-zerocopy"`
-		Queue          uint   `yaml:"queue"`
+		Interface       string `yaml:"interface"`
+		PreferHugepages bool   `yaml:"prefer-hugepages"`
+		PreferZerocopy  bool   `yaml:"prefer-zerocopy"`
+		Queue           uint   `yaml:"queue"`
 
 		DestMAC   string `yaml:"dest-mac"` // MAC of router.interface1
 		SrcIP     string `yaml:"src-ip"`
@@ -57,9 +59,10 @@ type Config struct {
 	} `yaml:"sender"`
 
 	Receiver struct {
-		Interface      string `yaml:"interface"`
-		PreferZerocopy bool   `yaml:"prefer-zerocopy"`
-		BatchSize      uint32 `yaml:"batch-size"`
+		Interface       string `yaml:"interface"`
+		PreferHugepages bool   `yaml:"prefer-hugepages"`
+		PreferZerocopy  bool   `yaml:"prefer-zerocopy"`
+		BatchSize       uint32 `yaml:"batch-size"`
 	} `yaml:"receiver"`
 
 	MTU   uint32 `yaml:"mtu"`
@@ -247,49 +250,27 @@ type TestResult struct {
 func makeRouterHandler(
 	if1Index, if2Index int, router2MAC, receiverMAC [6]byte,
 ) func(*afxdp.Packet) (int, error) {
-	const (
-		EthHdrLen = 14
-		IPHdrMin  = 20
-	)
-
 	return func(p *afxdp.Packet) (int, error) {
 		buf := p.Buf
 
-		// Fast path: single bounds check
-		if len(buf) < EthHdrLen+IPHdrMin {
+		// Fast path: single load of dst IP third octet
+		if len(buf) < 34 { // 14 + 20
 			return -1, nil
 		}
 
-		// EtherType (big-endian uint16)
-		ethType := binary.BigEndian.Uint16(buf[12:14])
-		if ethType != 0x0800 { // IPv4
+		// Check EtherType inline (avoid Uint16 call)
+		if buf[12] != 0x08 || buf[13] != 0x00 {
 			return -1, nil
 		}
 
-		ip := buf[EthHdrLen:]
+		// Direct byte access instead of BigEndian.Uint32
+		ipDst2 := buf[16+14+2] // Third octet of dst IP
 
-		// IPv4 version check (header length ignored since you don't route TCP options)
-		if ip[0]>>4 != 4 {
-			return -1, nil
-		}
-
-		// Destination IP (fast uint32 load)
-		dst := binary.BigEndian.Uint32(ip[16:20])
-
-		// Match 10.0.X.X using mask
-		if (dst & 0xFFFF0000) != 0x0A000000 {
-			return -1, nil
-		}
-
-		third := byte(dst >> 8) // dst[2]
-
-		switch third {
+		switch ipDst2 {
 		case 1:
-			// -> out interface1
 			return if1Index, nil
-
 		case 2:
-			// -> out interface2 (MAC rewrite)
+			// MAC rewrite (already optimized with copy)
 			copy(buf[0:6], receiverMAC[:])
 			copy(buf[6:12], router2MAC[:])
 			return if2Index, nil
@@ -302,14 +283,20 @@ func makeRouterHandler(
 // runRouter starts the router processor.
 func runRouter(ctx context.Context, conf *Config, router2MAC, receiverMAC [6]byte) error {
 	iface1, err := afxdp.MakeInterface(conf.Router.Interface1,
-		afxdp.InterfaceConfig{PreferZerocopy: conf.Router.PreferZerocopy})
+		afxdp.InterfaceConfig{
+			PreferHugepages: conf.Router.PreferHugepages,
+			PreferZerocopy:  conf.Router.PreferZerocopy,
+		})
 	if err != nil {
 		return fmt.Errorf("router iface1: %w", err)
 	}
 	defer iface1.Close()
 
 	iface2, err := afxdp.MakeInterface(conf.Router.Interface2,
-		afxdp.InterfaceConfig{PreferZerocopy: conf.Router.PreferZerocopy})
+		afxdp.InterfaceConfig{
+			PreferHugepages: conf.Router.PreferHugepages,
+			PreferZerocopy:  conf.Router.PreferZerocopy,
+		})
 	if err != nil {
 		return fmt.Errorf("router iface2: %w", err)
 	}
@@ -368,8 +355,8 @@ func runSender(
 	defer sock.Close()
 
 	ifaceName, _ := iface.Info()
-	fmt.Fprintf(os.Stderr, "TX on %s:%d (zerocopy=%t)\n",
-		ifaceName, conf.Queue, sock.IsZerocopy())
+	fmt.Fprintf(os.Stderr, "TX on %s:%d (hugepages=%t; zerocopy=%t)\n",
+		ifaceName, conf.Queue, sock.IsHugepages(), sock.IsZerocopy())
 
 	addrs := make([]uint64, 0, batchSize)
 	lens := make([]uint32, 0, batchSize)
@@ -725,11 +712,17 @@ func runBenchmark(ctx context.Context, conf *Config, stats *Stats) {
 
 	// Sender / receiver interfaces.
 	ifaceSender, err := afxdp.MakeInterface(conf.Sender.Interface,
-		afxdp.InterfaceConfig{PreferZerocopy: conf.Sender.PreferZerocopy})
+		afxdp.InterfaceConfig{
+			PreferHugepages: conf.Sender.PreferHugepages,
+			PreferZerocopy:  conf.Sender.PreferZerocopy,
+		})
 	fatalIf(err, "sender iface")
 
 	ifaceReceiver, err := afxdp.MakeInterface(conf.Receiver.Interface,
-		afxdp.InterfaceConfig{PreferZerocopy: conf.Receiver.PreferZerocopy})
+		afxdp.InterfaceConfig{
+			PreferHugepages: conf.Receiver.PreferHugepages,
+			PreferZerocopy:  conf.Receiver.PreferZerocopy,
+		})
 	fatalIf(err, "receiver iface")
 
 	ctxRouter, cancelRouter := context.WithCancel(ctx)

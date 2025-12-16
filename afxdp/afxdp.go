@@ -40,7 +40,8 @@ var (
 
 // InterfaceConfig controls how AF_XDP is attached to a network interface.
 type InterfaceConfig struct {
-	PreferZerocopy bool
+	PreferHugepages bool
+	PreferZerocopy  bool
 }
 
 type SocketConfig struct {
@@ -96,12 +97,14 @@ func (c *SocketConfig) ValidateAndSetDefaults() error {
 // It owns the XDP program and eBPF objects and can create AF_XDP sockets
 // bound to individual hardware queues.
 type Interface struct {
-	ifaceName      string
-	ifaceIndex     int
-	preferZerocopy bool
+	ifaceName  string
+	ifaceIndex int
 
 	link link.Link
 	objs *xdp.XdpProgObjects
+
+	preferZerocopy  bool
+	preferHugepages bool
 }
 
 func (i *Interface) Info() (name string, index int) {
@@ -124,11 +127,12 @@ func MakeInterface(iface string, conf InterfaceConfig) (*Interface, error) {
 	}
 
 	return &Interface{
-		ifaceName:      iface,
-		preferZerocopy: conf.PreferZerocopy,
-		ifaceIndex:     netIf.Index,
-		link:           l,
-		objs:           objs,
+		ifaceName:       iface,
+		preferZerocopy:  conf.PreferZerocopy,
+		preferHugepages: conf.PreferHugepages,
+		ifaceIndex:      netIf.Index,
+		link:            l,
+		objs:            objs,
 	}, nil
 }
 
@@ -347,8 +351,41 @@ func mmapRegion(fd int, length uintptr, offset uintptr) ([]byte, error) {
 }
 
 // mmapUmem maps an anonymous, page-backed region for UMEM.
-func mmapUmem(length uintptr) ([]byte, error) {
-	addr, _, errno := unix.Syscall6(unix.SYS_MMAP,
+// First attempts to use hugepages (2MB) for better TLB performance,
+// falls back to normal pages if hugepages are unavailable.
+func mmapUmem(
+	length uintptr, preferHugepages bool,
+) (buf []byte, hugepages bool, err error) {
+	var addr uintptr
+	var errno unix.Errno
+
+	makeSlice := func() []byte {
+		sh := &struct {
+			Addr uintptr
+			Len  int
+			Cap  int
+		}{addr, int(length), int(length)}
+		return *(*[]byte)(unsafe.Pointer(sh))
+	}
+
+	if preferHugepages {
+		// Try hugepages first (MAP_HUGETLB with 2MB pages)
+		// This reduces TLB misses significantly for large UMEM regions.
+		addr, _, errno = unix.Syscall6(unix.SYS_MMAP,
+			0,
+			length,
+			unix.PROT_READ|unix.PROT_WRITE,
+			unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_HUGETLB|unix.MAP_HUGE_2MB,
+			^uintptr(0), // fd = -1
+			0,
+		)
+		if errno == 0 {
+			return makeSlice(), true, nil
+		}
+		// Hugepages allocation failed, fall back to normal pages.
+	}
+
+	addr, _, errno = unix.Syscall6(unix.SYS_MMAP,
 		0,
 		length,
 		unix.PROT_READ|unix.PROT_WRITE,
@@ -357,14 +394,10 @@ func mmapUmem(length uintptr) ([]byte, error) {
 		0,
 	)
 	if errno != 0 {
-		return nil, errno
+		return nil, hugepages, errno
 	}
-	sh := &struct {
-		Addr uintptr
-		Len  int
-		Cap  int
-	}{addr, int(length), int(length)}
-	return *(*[]byte)(unsafe.Pointer(sh)), nil
+
+	return makeSlice(), hugepages, nil
 }
 
 // makeQueue builds RX/TX user queue from mmap + offsets.
@@ -512,9 +545,10 @@ func wakeupTxQueue(fd int) error {
 //
 // WARNING: Socket is not safe for concurrent use.
 type Socket struct {
-	conf       SocketConfig
-	isZerocopy bool
-	fd         int
+	conf        SocketConfig
+	isZerocopy  bool
+	isHugepages bool
+	fd          int
 
 	// umem is the contiguous UMEM region backing all RX/TX frames.
 	// Both RX and TX rings reference offsets into this slice.
@@ -617,9 +651,10 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 		return nil, fail("opening AF_XDP socket: %w", err)
 	}
 
-	// UMEM registration.
+	// UMEM registration with hugepages support.
 	umemLen := uintptr(conf.NumFrames) * uintptr(conf.FrameSize)
-	umem, err = mmapUmem(umemLen)
+	var hugepages bool
+	umem, hugepages, err = mmapUmem(umemLen, i.preferHugepages)
 	if err != nil {
 		return nil, fail("mmap UMEM: %w", err)
 	}
@@ -777,21 +812,22 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 	}
 
 	return &Socket{
-		conf:       conf,
-		isZerocopy: zerocopy,
-		fd:         fd,
-		umem:       umem,
-		tx:         txQ,
-		cq:         cqQ,
-		rx:         rxQ,
-		fq:         fqQ,
-		txRegion:   txRegion,
-		rxRegion:   rxRegion,
-		cqRegion:   cqRegion,
-		fqRegion:   fqRegion,
-		freeFrames: freeFrames,
-		compBuf:    make([]uint64, conf.BatchSize),
-		iface:      i,
+		conf:        conf,
+		isZerocopy:  zerocopy,
+		isHugepages: hugepages,
+		fd:          fd,
+		umem:        umem,
+		tx:          txQ,
+		cq:          cqQ,
+		rx:          rxQ,
+		fq:          fqQ,
+		txRegion:    txRegion,
+		rxRegion:    rxRegion,
+		cqRegion:    cqRegion,
+		fqRegion:    fqRegion,
+		freeFrames:  freeFrames,
+		compBuf:     make([]uint64, conf.BatchSize),
+		iface:       i,
 	}, nil
 }
 
@@ -799,6 +835,9 @@ func (i *Interface) Open(conf SocketConfig) (*Socket, error) {
 // May return false even if PreferZerocopy was true because the corresponding queue
 // may not support XDP_ZEROCOPY mode and the socket fall back to XDP_COPY automatically.
 func (s *Socket) IsZerocopy() bool { return s.isZerocopy }
+
+// IsHugepages reports whether the socket UMEM was mmapped via hugepages.
+func (s *Socket) IsHugepages() bool { return s.isHugepages }
 
 // Close releases the socket, UMEM and kernel resources.
 func (s *Socket) Close() error {

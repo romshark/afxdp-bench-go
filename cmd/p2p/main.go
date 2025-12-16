@@ -25,22 +25,24 @@ import (
 
 type Config struct {
 	Egress struct {
-		Interface      string `yaml:"interface"`
-		PreferZerocopy bool   `yaml:"prefer-zerocopy"`
-		Queue          uint   `yaml:"queue"`
-		DestMAC        string `yaml:"dest-mac"`
-		SrcIP          string `yaml:"src-ip"`
-		DstIP          string `yaml:"dst-ip"`
-		SrcPort        uint16 `yaml:"src-port"`
-		DstPort        uint16 `yaml:"dst-port"`
-		BatchSize      uint32 `yaml:"batch-size"`
-		RatePPS        uint64 `yaml:"rate-pps"`
+		Interface       string `yaml:"interface"`
+		PreferHugepages bool   `yaml:"prefer-hugepages"`
+		PreferZerocopy  bool   `yaml:"prefer-zerocopy"`
+		Queue           uint   `yaml:"queue"`
+		DestMAC         string `yaml:"dest-mac"`
+		SrcIP           string `yaml:"src-ip"`
+		DstIP           string `yaml:"dst-ip"`
+		SrcPort         uint16 `yaml:"src-port"`
+		DstPort         uint16 `yaml:"dst-port"`
+		BatchSize       uint32 `yaml:"batch-size"`
+		RatePPS         uint64 `yaml:"rate-pps"`
 	} `yaml:"egress"`
 
 	Ingress struct {
-		Interface      string `yaml:"interface"`
-		PreferZerocopy bool   `yaml:"prefer-zerocopy"`
-		BatchSize      uint32 `yaml:"batch-size"`
+		Interface       string `yaml:"interface"`
+		PreferHugepages bool   `yaml:"prefer-hugepages"`
+		PreferZerocopy  bool   `yaml:"prefer-zerocopy"`
+		BatchSize       uint32 `yaml:"batch-size"`
 	} `yaml:"ingress"`
 
 	MTU   uint32 `yaml:"mtu"`
@@ -501,8 +503,8 @@ func runSender(
 	defer sock.Close()
 
 	ifaceName, _ := iface.Info()
-	fmt.Fprintf(os.Stderr, "TX on %s:%d (zerocopy=%t)\n",
-		ifaceName, conf.Queue, sock.IsZerocopy())
+	fmt.Fprintf(os.Stderr, "TX on %s:%d (hugepages=%t; zerocopy=%t)\n",
+		ifaceName, conf.Queue, sock.IsHugepages(), sock.IsZerocopy())
 
 	addrs := make([]uint64, 0, batchSize)
 	lens := make([]uint32, 0, batchSize)
@@ -596,13 +598,15 @@ func main() {
 
 	ifaceE, err := afxdp.MakeInterface(
 		conf.Egress.Interface, afxdp.InterfaceConfig{
-			PreferZerocopy: conf.Egress.PreferZerocopy,
+			PreferHugepages: conf.Egress.PreferHugepages,
+			PreferZerocopy:  conf.Egress.PreferZerocopy,
 		})
 	fatalIf(err, "egress iface")
 
 	ifaceI, err := afxdp.MakeInterface(
 		conf.Ingress.Interface, afxdp.InterfaceConfig{
-			PreferZerocopy: conf.Ingress.PreferZerocopy,
+			PreferHugepages: conf.Ingress.PreferHugepages,
+			PreferZerocopy:  conf.Ingress.PreferZerocopy,
 		})
 	fatalIf(err, "ingress iface")
 

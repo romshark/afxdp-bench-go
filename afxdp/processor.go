@@ -52,10 +52,6 @@ func RunProcessor(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	packetPool := sync.Pool{
-		New: func() any { return &Packet{} },
-	}
-
 	var workers []*worker
 	socketsByIface := make(byIface)
 
@@ -183,6 +179,8 @@ func RunProcessor(
 			releaseBuf := make([]Frame, 0, w.batch)
 			usedTargets := make(map[*worker]struct{})
 
+			var p Packet
+
 			for ctx.Err() == nil {
 				frames := w.sock.Receive(rxBuf)
 				if len(frames) == 0 {
@@ -199,15 +197,13 @@ func RunProcessor(
 				}
 
 				for _, fr := range frames {
-					p := packetPool.Get().(*Packet)
 					p.Buf = fr.Buf
 					p.Addr = fr.Addr
 					p.Len = uint32(len(fr.Buf))
 					p.Ingress = w.ifaceName
 					p.Queue = w.queue
 
-					fwdIdx, err := fn(p)
-					packetPool.Put(p)
+					fwdIdx, err := fn(&p)
 					if err != nil {
 						errCh <- err
 						return

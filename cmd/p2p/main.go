@@ -16,6 +16,8 @@ import (
 	"time"
 
 	afxdp "github.com/romshark/afxdp-bench-go/afxdp"
+	"github.com/romshark/afxdp-bench-go/ifacestat"
+	"github.com/romshark/afxdp-bench-go/ratelimit"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 	"gopkg.in/yaml.v3"
@@ -23,21 +25,22 @@ import (
 
 type Config struct {
 	Egress struct {
-		Interface string `yaml:"interface"`
-		Zerocopy  bool   `yaml:"zerocopy"`
-		Queue     uint   `yaml:"queue"`
-		DestMAC   string `yaml:"dest-mac"`
-		SrcIP     string `yaml:"src-ip"`
-		DstIP     string `yaml:"dst-ip"`
-		SrcPort   uint16 `yaml:"src-port"`
-		DstPort   uint16 `yaml:"dst-port"`
-		BatchSize uint32 `yaml:"batch-size"`
+		Interface      string `yaml:"interface"`
+		PreferZerocopy bool   `yaml:"prefer-zerocopy"`
+		Queue          uint   `yaml:"queue"`
+		DestMAC        string `yaml:"dest-mac"`
+		SrcIP          string `yaml:"src-ip"`
+		DstIP          string `yaml:"dst-ip"`
+		SrcPort        uint16 `yaml:"src-port"`
+		DstPort        uint16 `yaml:"dst-port"`
+		BatchSize      uint32 `yaml:"batch-size"`
+		RatePPS        uint64 `yaml:"rate-pps"`
 	} `yaml:"egress"`
 
 	Ingress struct {
-		Interface string `yaml:"interface"`
-		Zerocopy  bool   `yaml:"zerocopy"`
-		BatchSize uint32 `yaml:"batch-size"`
+		Interface      string `yaml:"interface"`
+		PreferZerocopy bool   `yaml:"prefer-zerocopy"`
+		BatchSize      uint32 `yaml:"batch-size"`
 	} `yaml:"ingress"`
 
 	MTU   uint32 `yaml:"mtu"`
@@ -49,11 +52,12 @@ func loadConfig() (*Config, error) {
 	fConfig := flag.String("config", "p2p.yaml", "path to config YAML file")
 	fIfaceE := flag.String("ie", "", "egress")
 	fIfaceI := flag.String("ii", "", "ingress")
-	fPreferZC := flag.Bool("z", false, "zerocopy")
+	fMode := flag.String("m", "", "overwrite copy/zc mode for all interfaces")
 	fDestMAC := flag.String("d", "", "dest mac")
 	fSrcIP := flag.String("s", "", "src ip")
 	fDstIP := flag.String("D", "", "dst ip")
 	fPort := flag.Uint("p", 0, "dst udp port")
+	fRate := flag.Int64("r", -1, "sender rate limit in PPS (<0 falls back to config)")
 	fCount := flag.Uint64("n", 0, "packet count")
 	fPktSize := flag.Uint("l", 1500, "pkt size")
 	fQueue := flag.Uint("q", 0, "queue id")
@@ -70,14 +74,20 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("parsing YAML: %w", err)
 	}
 
+	switch *fMode {
+	case "copy":
+		conf.Egress.PreferZerocopy, conf.Ingress.PreferZerocopy = false, false
+	case "zerocopy":
+		conf.Egress.PreferZerocopy, conf.Ingress.PreferZerocopy = true, true
+	}
+	if *fRate >= 0 {
+		conf.Egress.RatePPS = uint64(*fRate)
+	}
 	if *fIfaceE != "" {
 		conf.Egress.Interface = *fIfaceE
 	}
 	if *fIfaceI != "" {
 		conf.Ingress.Interface = *fIfaceI
-	}
-	if *fPreferZC {
-		conf.Egress.Zerocopy, conf.Ingress.Zerocopy = true, true
 	}
 	if *fDestMAC != "" {
 		conf.Egress.DestMAC = *fDestMAC
@@ -459,6 +469,7 @@ type SenderConfig struct {
 	PktSize uint32
 	Queue   uint
 	ZC      bool
+	RatePPS uint64
 }
 
 func runSender(
@@ -497,6 +508,7 @@ func runSender(
 	lens := make([]uint32, 0, batchSize)
 	var seq uint32
 
+	limiter := ratelimit.New(conf.RatePPS)
 	start := time.Now()
 
 	for stats.TxPackets.Load() < conf.Count {
@@ -520,6 +532,8 @@ func runSender(
 
 		addrs = addrs[:0]
 		lens = lens[:0]
+
+		limiter.ThrottleN(uint64(sendable)) // No-op if unlimited.
 
 		for range sendable {
 			f := sock.NextFrame()
@@ -563,6 +577,18 @@ func main() {
 	conf, err := loadConfig()
 	fatalIf(err, "reading config")
 
+	ifaceList := []string{
+		conf.Egress.Interface,
+		conf.Ingress.Interface,
+	}
+	counters := []ifacestat.Counter{
+		ifacestat.TxPackets, ifacestat.TxBytes,
+		ifacestat.RxPackets, ifacestat.RxBytes,
+	}
+
+	ifaceStatsBefore, err := ifacestat.Snapshot(ifaceList, counters...)
+	fatalIf(err, "taking interface stats (before)")
+
 	fmt.Fprintf(os.Stderr, "FINAL CONFIG:\n")
 	b, err := yaml.Marshal(conf)
 	fatalIf(err, "encoding final YAML config")
@@ -571,13 +597,13 @@ func main() {
 
 	ifaceE, err := afxdp.MakeInterface(
 		conf.Egress.Interface, afxdp.InterfaceConfig{
-			PreferZerocopy: conf.Egress.Zerocopy,
+			PreferZerocopy: conf.Egress.PreferZerocopy,
 		})
 	fatalIf(err, "egress iface")
 
 	ifaceI, err := afxdp.MakeInterface(
 		conf.Ingress.Interface, afxdp.InterfaceConfig{
-			PreferZerocopy: conf.Ingress.Zerocopy,
+			PreferZerocopy: conf.Ingress.PreferZerocopy,
 		})
 	fatalIf(err, "ingress iface")
 
@@ -592,6 +618,19 @@ func main() {
 
 	// Run benchmark.
 	runBenchmark(ifaceI, ifaceE, conf, &stats)
+
+	statsAfter, err := ifacestat.Snapshot(ifaceList, counters...)
+	fatalIf(err, "taking interface stats (after)")
+
+	ifaceDeltas := statsAfter.Since(ifaceStatsBefore)
+
+	fmt.Fprintf(os.Stderr, "\nINTERFACE COUNTERS:\n")
+	err = ifacestat.Print(os.Stderr, ifaceDeltas, map[string]string{
+		conf.Egress.Interface:  "egress",
+		conf.Ingress.Interface: "ingress",
+	})
+	fatalIf(err, "printing interface stats diff")
+	fmt.Fprintln(os.Stderr)
 }
 
 func runBenchmark(ifaceI, ifaceE *afxdp.Interface, conf *Config, stats *Stats) {
@@ -617,7 +656,8 @@ func runBenchmark(ifaceI, ifaceE *afxdp.Interface, conf *Config, stats *Stats) {
 		Count:   conf.Count,
 		PktSize: conf.MTU,
 		Queue:   conf.Egress.Queue,
-		ZC:      conf.Egress.Zerocopy,
+		ZC:      conf.Egress.PreferZerocopy,
+		RatePPS: conf.Egress.RatePPS,
 	}, stats, conf.Egress.BatchSize)
 
 	time.Sleep(300 * time.Millisecond)
@@ -651,7 +691,8 @@ func runTest(ifaceI, ifaceE *afxdp.Interface, conf *Config, stats *Stats) {
 		Count:   conf.Count,
 		PktSize: conf.MTU,
 		Queue:   conf.Egress.Queue,
-		ZC:      conf.Egress.Zerocopy,
+		ZC:      conf.Egress.PreferZerocopy,
+		RatePPS: conf.Egress.RatePPS,
 	}, stats, conf.Egress.BatchSize)
 
 	{

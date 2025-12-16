@@ -1,6 +1,6 @@
 egress:
   interface: "center_1"
-  zerocopy: false
+  prefer-zerocopy: true
   queue: 0
   dest-mac: "58:a2:e1:04:a9:db"
   src-ip: "192.168.1.10"
@@ -8,9 +8,10 @@ egress:
   dst-port: 9000
   src-port: 12345
   batch-size: 8
+  rate-pps: 0 # unlimited, send at max speed.
 ingress:
   interface: "top_2"
-  zerocopy: false
+  prefer-zerocopy: true
   batch-size: 8
 mtu: 1500 # packet size
 count: 1000000 # how many packets to send

@@ -17,6 +17,8 @@ import (
 
 	afxdp "github.com/romshark/afxdp-bench-go/afxdp"
 	"github.com/romshark/afxdp-bench-go/ifacestat"
+	"github.com/romshark/afxdp-bench-go/ratelimit"
+
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 	"gopkg.in/yaml.v3"
@@ -34,16 +36,16 @@ import (
 
 type Config struct {
 	Router struct {
-		Interface1 string `yaml:"interface1"`
-		Interface2 string `yaml:"interface2"`
-		Zerocopy   bool   `yaml:"zerocopy"`
-		BatchSize  uint32 `yaml:"batch-size"`
+		Interface1     string `yaml:"interface1"`
+		Interface2     string `yaml:"interface2"`
+		PreferZerocopy bool   `yaml:"prefer-zerocopy"`
+		BatchSize      uint32 `yaml:"batch-size"`
 	} `yaml:"router"`
 
 	Sender struct {
-		Interface string `yaml:"interface"`
-		Zerocopy  bool   `yaml:"zerocopy"`
-		Queue     uint   `yaml:"queue"`
+		Interface      string `yaml:"interface"`
+		PreferZerocopy bool   `yaml:"prefer-zerocopy"`
+		Queue          uint   `yaml:"queue"`
 
 		DestMAC   string `yaml:"dest-mac"` // MAC of router.interface1
 		SrcIP     string `yaml:"src-ip"`
@@ -51,12 +53,13 @@ type Config struct {
 		SrcPort   uint16 `yaml:"src-port"`
 		DstPort   uint16 `yaml:"dst-port"`
 		BatchSize uint32 `yaml:"batch-size"`
+		RatePPS   uint64 `yaml:"rate-pps"` // 0 = unlimited, max speed.
 	} `yaml:"sender"`
 
 	Receiver struct {
-		Interface string `yaml:"interface"`
-		Zerocopy  bool   `yaml:"zerocopy"`
-		BatchSize uint32 `yaml:"batch-size"`
+		Interface      string `yaml:"interface"`
+		PreferZerocopy bool   `yaml:"prefer-zerocopy"`
+		BatchSize      uint32 `yaml:"batch-size"`
 	} `yaml:"receiver"`
 
 	MTU   uint32 `yaml:"mtu"`
@@ -66,6 +69,8 @@ type Config struct {
 
 func loadConfig() (*Config, error) {
 	fConfig := flag.String("config", "route.yaml", "path to config YAML file")
+	fMode := flag.String("m", "", "overwrite copy/zc mode for all interfaces")
+	fRate := flag.Int64("r", -1, "sender rate limit in PPS (<0 falls back to config)")
 	fCount := flag.Uint64("n", 0, "packet count override")
 	fMTU := flag.Uint("l", 0, "pkt size override (MTU)")
 	fTest := flag.Bool("test", false, "enable test mode (override)")
@@ -80,6 +85,15 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("parsing YAML: %w", err)
 	}
 
+	switch *fMode {
+	case "copy":
+		conf.Sender.PreferZerocopy, conf.Receiver.PreferZerocopy = false, false
+	case "zerocopy":
+		conf.Sender.PreferZerocopy, conf.Receiver.PreferZerocopy = true, true
+	}
+	if *fRate >= 0 {
+		conf.Sender.RatePPS = uint64(*fRate)
+	}
 	if *fCount != 0 {
 		conf.Count = *fCount
 	}
@@ -286,14 +300,14 @@ func makeRouterHandler(
 // runRouter starts the router processor.
 func runRouter(ctx context.Context, conf *Config, router2MAC, receiverMAC [6]byte) error {
 	iface1, err := afxdp.MakeInterface(conf.Router.Interface1,
-		afxdp.InterfaceConfig{PreferZerocopy: conf.Router.Zerocopy})
+		afxdp.InterfaceConfig{PreferZerocopy: conf.Router.PreferZerocopy})
 	if err != nil {
 		return fmt.Errorf("router iface1: %w", err)
 	}
 	defer iface1.Close()
 
 	iface2, err := afxdp.MakeInterface(conf.Router.Interface2,
-		afxdp.InterfaceConfig{PreferZerocopy: conf.Router.Zerocopy})
+		afxdp.InterfaceConfig{PreferZerocopy: conf.Router.PreferZerocopy})
 	if err != nil {
 		return fmt.Errorf("router iface2: %w", err)
 	}
@@ -320,6 +334,7 @@ type SenderConfig struct {
 	PktSize uint32
 	Queue   uint
 	ZC      bool
+	RatePPS uint64
 }
 
 func runSender(
@@ -342,9 +357,9 @@ func runSender(
 	sock, err := iface.Open(afxdp.SocketConfig{
 		QueueID:   uint32(conf.Queue),
 		NumFrames: 1024 * 16,
-		RxSize:    1024 * 8,
-		TxSize:    1024 * 8,
-		CqSize:    1024 * 8,
+		RxSize:    1024 * 2,
+		TxSize:    1024 * 2,
+		CqSize:    1024 * 2,
 		BatchSize: batchSize,
 	})
 	fatalIf(err, "open TX socket")
@@ -358,6 +373,7 @@ func runSender(
 	lens := make([]uint32, 0, batchSize)
 	var seq uint32
 
+	limiter := ratelimit.New(conf.RatePPS)
 	start := time.Now()
 
 	for stats.TxPackets.Load() < conf.Count {
@@ -381,6 +397,8 @@ func runSender(
 
 		addrs = addrs[:0]
 		lens = lens[:0]
+
+		limiter.ThrottleN(uint64(sendable)) // No-op if unlimited.
 
 		for range sendable {
 			f := sock.NextFrame()
@@ -448,9 +466,9 @@ func runReceiverBenchmark(
 			sock, err := iface.Open(afxdp.SocketConfig{
 				QueueID:   q,
 				NumFrames: 1024 * 16,
-				RxSize:    1024 * 8,
-				TxSize:    1024 * 8,
-				CqSize:    1024 * 8,
+				RxSize:    1024 * 2,
+				TxSize:    1024 * 2,
+				CqSize:    1024 * 2,
 				BatchSize: batch,
 			})
 			fatalIf(err, "opening RX socket")
@@ -525,9 +543,9 @@ func runReceiverTest(
 			sock, err := iface.Open(afxdp.SocketConfig{
 				QueueID:   q,
 				NumFrames: 1024 * 16,
-				RxSize:    1024 * 8,
-				TxSize:    1024 * 8,
-				CqSize:    1024 * 8,
+				RxSize:    1024 * 2,
+				TxSize:    1024 * 2,
+				CqSize:    1024 * 2,
 				BatchSize: conf.Receiver.BatchSize,
 			})
 			fatalIf(err, "opening test RX socket")
@@ -707,11 +725,11 @@ func runBenchmark(ctx context.Context, conf *Config, stats *Stats) {
 
 	// Sender / receiver interfaces.
 	ifaceSender, err := afxdp.MakeInterface(conf.Sender.Interface,
-		afxdp.InterfaceConfig{PreferZerocopy: conf.Sender.Zerocopy})
+		afxdp.InterfaceConfig{PreferZerocopy: conf.Sender.PreferZerocopy})
 	fatalIf(err, "sender iface")
 
 	ifaceReceiver, err := afxdp.MakeInterface(conf.Receiver.Interface,
-		afxdp.InterfaceConfig{PreferZerocopy: conf.Receiver.Zerocopy})
+		afxdp.InterfaceConfig{PreferZerocopy: conf.Receiver.PreferZerocopy})
 	fatalIf(err, "receiver iface")
 
 	ctxRouter, cancelRouter := context.WithCancel(ctx)
@@ -745,7 +763,8 @@ func runBenchmark(ctx context.Context, conf *Config, stats *Stats) {
 		Count:   conf.Count,
 		PktSize: conf.MTU,
 		Queue:   conf.Sender.Queue,
-		ZC:      conf.Sender.Zerocopy,
+		ZC:      conf.Sender.PreferZerocopy,
+		RatePPS: conf.Sender.RatePPS,
 	}, stats, conf.Sender.BatchSize)
 
 	wait(1000*time.Millisecond, "sender")
@@ -767,11 +786,11 @@ func runTest(ctx context.Context, conf *Config, stats *Stats) {
 
 	// Sender / receiver interfaces.
 	ifaceSender, err := afxdp.MakeInterface(conf.Sender.Interface,
-		afxdp.InterfaceConfig{PreferZerocopy: conf.Sender.Zerocopy})
+		afxdp.InterfaceConfig{PreferZerocopy: conf.Sender.PreferZerocopy})
 	fatalIf(err, "sender iface")
 
 	ifaceReceiver, err := afxdp.MakeInterface(conf.Receiver.Interface,
-		afxdp.InterfaceConfig{PreferZerocopy: conf.Receiver.Zerocopy})
+		afxdp.InterfaceConfig{PreferZerocopy: conf.Receiver.PreferZerocopy})
 	fatalIf(err, "receiver iface")
 
 	ctxRouter, cancelRouter := context.WithCancel(ctx)
@@ -806,7 +825,8 @@ func runTest(ctx context.Context, conf *Config, stats *Stats) {
 		Count:   conf.Count,
 		PktSize: conf.MTU,
 		Queue:   conf.Sender.Queue,
-		ZC:      conf.Sender.Zerocopy,
+		ZC:      conf.Sender.PreferZerocopy,
+		RatePPS: conf.Sender.RatePPS,
 	}, stats, conf.Sender.BatchSize)
 
 	wait(1000*time.Millisecond, "sender")

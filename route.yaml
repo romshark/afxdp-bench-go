@@ -6,24 +6,25 @@
 router:
   interface1: "bottom_1" # connected to top_1
   interface2: "center_2" # connected to bottom_2
-  zerocopy: true
-  batch-size: 32
+  prefer-zerocopy: true
+  batch-size: 8
 
 sender:
   interface: "top_1" # connected to bottom_1
-  zerocopy: true
+  prefer-zerocopy: true
   queue: 0
   dest-mac: "58:a2:e1:04:a9:ba" # MAC of bottom_1 (router.interface1)
   src-ip: "10.0.0.1"
   dst-ip: "10.0.2.1" # router will forward this to interface2
   src-port: 9000
   dst-port: 9000
-  batch-size: 32
+  batch-size: 8
+  rate-pps: 0 # unlimited, send at max speed.
 
 receiver:
   interface: "bottom_2" # connected to center_2
-  zerocopy: true
-  batch-size: 32
+  prefer-zerocopy: true
+  batch-size: 8
 
 mtu: 1500
 count: 1000000

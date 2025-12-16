@@ -88,8 +88,10 @@ func loadConfig() (*Config, error) {
 	switch *fMode {
 	case "copy":
 		conf.Sender.PreferZerocopy, conf.Receiver.PreferZerocopy = false, false
+		conf.Router.PreferZerocopy = false
 	case "zerocopy":
 		conf.Sender.PreferZerocopy, conf.Receiver.PreferZerocopy = true, true
+		conf.Router.PreferZerocopy = true
 	}
 	if *fRate >= 0 {
 		conf.Sender.RatePPS = uint64(*fRate)
